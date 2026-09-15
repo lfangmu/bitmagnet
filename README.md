@@ -12,6 +12,7 @@
 |------|------|------|------|
 | bitmagnet | `ghcr.io/bitmagnet-io/bitmagnet:latest` | 3333 / 3334(TCP+UDP) | Web UI + GraphQL + Torznab + DHT 爬虫 |
 | postgres | `postgres:16-alpine` | （不对外） | 元数据存储，官方 minimal 配置，不含 redis |
+| bitmagnet-bot | 本仓库 `./manager`（python:3.13-slim） | 8790 | 管理面板：搜索/一键发种、系统状态、TMDB 配置、Clash 出网自愈 |
 
 ## 快速开始
 
@@ -23,6 +24,8 @@ cp .env.example .env      # 按需改密码/端口/数据目录
 
 Web UI： http://<本机IP>:3333 （GraphQL Playground 在 `/graphql`，Torznab 在 `/torznab`）
 
+管理面板 bitmagnet-bot： http://<本机IP>:8790 （搜索/一键发种、系统状态、TMDB 配置、Clash 出网自愈）
+
 ## 配置（.env）
 
 | 变量 | 默认 | 说明 |
@@ -32,6 +35,10 @@ Web UI： http://<本机IP>:3333 （GraphQL Playground 在 `/graphql`，Torznab 
 | `DATA_DIR` | `./data` | postgres 数据 + bitmagnet 配置根目录 |
 | `TMDB_API_KEY` | 空 | 可选，开启影视元数据 enrichment |
 | `TMDB_ENABLED` | `false` | TMDB 开关；填了 API Key 时改 `true`（默认关，开箱即索引，无需外网 TMDB） |
+| `TMDB_PROXY` | 空 | 可选，TMDB 出网代理（面板保存后自动重建 bitmagnet 生效） |
+| `BOT_PORT` | `8790` | 管理面板 bitmagnet-bot 宿主机映射端口（容器内固定 8790） |
+| `QBITTORRENT_URL/USER/PASS/CATEGORY` | 空 | 可选，开启「一键发 qBittorrent」下载入口 |
+| `CLASH_API_URL/TOKEN/PROXY` | 空 | 可选，开启 Clash 出网自愈（环境专属，按需填写） |
 
 ## 验收契约（verify_clean.sh 断言）
 
@@ -39,6 +46,7 @@ Web UI： http://<本机IP>:3333 （GraphQL Playground 在 `/graphql`，Torznab 
 2. `http://localhost:3333/` 返回 200
 3. Torznab `t=capabilities` 返回 200
 4. DHT 爬虫在 180s 内索引到数据（网络受限时仅为 WARN，非工程缺陷）
+5. `bitmagnet-bot` running 且 `http://localhost:8790/` 返回 200
 
 ## 复用历史数据
 
@@ -49,5 +57,8 @@ Web UI： http://<本机IP>:3333 （GraphQL Playground 在 `/graphql`，Torznab 
 
 - 不含 redis / gluetun：对齐官方 minimal，轻量部署；如需队列增强或 VPN 出口可自行追加服务。
 - 不引入 PUID/PGID：该概念属于 linuxserver 镜像，本工程镜像以各自默认用户运行。
+- 管理面板 `bitmagnet-bot` 运行所需：挂载宿主 `docker.sock`（只读容器状态 / 重启）与项目 `.env`
+  （配置页改写 TMDB 项后，在后台触发 `docker compose up -d` 重建受影响容器，配置即时生效）。
+  其镜像内打入 docker CLI + compose 插件（静态二进制，仅 linux/amd64），无其他系统依赖。
 - 本工程为通用公开模板，**不含任何环境专属的网络 hack**（如特定 DNS / 代理绕过），
   使用者按需根据自身网络环境自行配置。

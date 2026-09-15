@@ -58,3 +58,41 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 管理面板 bitmagnet-bot（一键搜索/发种、系统状态、TMDB 配置、Clash 出网自愈）
+  # 零 Python 外部依赖；配置保存经 docker.sock 触发 `docker compose up -d` 重建容器。
+  # 挂载项目 .env 与 docker-compose.yml，使其改写 TMDB 配置后能自动重建 bitmagnet 服务。
+  # ---------------------------------------------------------------------------
+  bitmagnet-bot:
+    build: ./manager
+    container_name: bitmagnet-bot
+    restart: unless-stopped
+    ports:
+      - "${BOT_PORT:-8790}:8790"
+    environment:
+      - PORT=8790
+      - BITMAGNET_HOST=http://bitmagnet:3333
+      # 配置页可改写项（与 bitmagnet 服务共用项目 .env，改写后自动重建）
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - TMDB_ENABLED=${TMDB_ENABLED:-false}
+      - TMDB_PROXY=${TMDB_PROXY:-}
+      # 可选：qBittorrent 一键下载（留空则不启用）
+      - QBITTORRENT_URL=${QBITTORRENT_URL:-}
+      - QBITTORRENT_USER=${QBITTORRENT_USER:-}
+      - QBITTORRENT_PASS=${QBITTORRENT_PASS:-}
+      - QBITTORRENT_CATEGORY=${QBITTORRENT_CATEGORY:-bitmagnet}
+      # 可选：Clash/OpenClash 出网自愈（环境专属，按需开启）
+      - CLASH_API_URL=${CLASH_API_URL:-}
+      - CLASH_API_TOKEN=${CLASH_API_TOKEN:-}
+      - CLASH_PROXY=${CLASH_PROXY:-}
+      # 容器内挂载路径（见 volumes）
+      - BITMAGNET_ENV_FILE=/host/bitmagnet/.env
+      - BITMAGNET_COMPOSE_FILE=/host/bitmagnet/docker-compose.yml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.env:/host/bitmagnet/.env
+      - ./docker-compose.yml:/host/bitmagnet/docker-compose.yml:ro
+    depends_on:
+      bitmagnet:
+        condition: service_started

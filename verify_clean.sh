@@ -38,6 +38,13 @@ done
 if [ "$n" -gt 0 ]; then check "DHT 已索引 ${n} 条" 0;
 else echo "  [WARN] DHT 仍未落库（可能网络/DHT 可达性，非工程缺陷）"; WARN=$((WARN+1)); fi
 
+echo "== 5. 管理面板 bitmagnet-bot =="
+docker inspect -f '{{.State.Status}}' bitmagnet-bot 2>/dev/null | grep -q running \
+  && check "bitmagnet-bot running" 0 || check "bitmagnet-bot running" 1
+BOT_PORT="${BOT_PORT:-8790}"
+bc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://localhost:${BOT_PORT}/" || echo 000)
+[ "$bc" = "200" ] && check "bot Web HTTP ${bc}" 0 || check "bot Web HTTP ${bc}" 1
+
 echo
 echo "==== 验收结果: PASS=${PASS} FAIL=${FAIL} WARN=${WARN} ===="
 [ "$FAIL" -eq 0 ]
