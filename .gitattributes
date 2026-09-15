@@ -1,0 +1,2 @@
+# 强制 LF 行尾：部署目标为 Linux(NAS)，CRLF 会让 shell 脚本与 compose 失效
+* text=auto eol=lf

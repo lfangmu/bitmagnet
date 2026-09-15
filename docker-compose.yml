@@ -1,0 +1,60 @@
+# BitMagnet · 自托管种子索引 / DHT 爬虫 / Torznab 接口
+# 用法： cp .env.example .env && ./deploy.sh
+# 起来后打开 http://<本机IP>:3333 （Web UI / GraphQL / Torznab 同源）
+#
+# 说明：
+# - 仅依赖 PostgreSQL（官方 minimal 配置），不含 redis / gluetun，匹配轻量部署。
+# - 镜像以各自默认用户运行（postgres 镜像内部 postgres 用户 / bitmagnet 以 root 写 /root/.config），
+#   故不引入 PUID/PGID（那是 linuxserver 镜像的概念，此处不适用）。
+# - 数据均落 ${DATA_DIR}（默认 ./data），干净卸载 = docker compose down -v。
+# - 本工程为通用公开模板，不含任何环境专属网络 hack。
+
+name: bitmagnet
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bitmagnet-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bitmagnet}
+      - POSTGRES_DB=bitmagnet
+      - PGUSER=postgres
+    shm_size: 1g
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      start_period: 20s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bitmagnet:
+    image: ghcr.io/bitmagnet-io/bitmagnet:latest
+    container_name: bitmagnet
+    restart: unless-stopped
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bitmagnet}
+      - POSTGRES_DB=bitmagnet
+      # TMDB 元数据 enrichment：默认关闭（无需外网 TMDB，开箱即索引）；
+      # 填了 TMDB_API_KEY 时请改为 true 以启用海报/年份/类型匹配。
+      - TMDB_ENABLED=${TMDB_ENABLED:-false}
+      # 可选：TMDB API Key 开启影视元数据 enrichment
+      # TMDB_API_KEY=
+    ports:
+      - "${WEB_PORT:-3333}:3333"   # Web UI / GraphQL API / Torznab 同源
+      - "3334:3334/tcp"            # DHT（TCP）
+      - "3334:3334/udp"            # DHT（UDP）
+    volumes:
+      - ${DATA_DIR:-./data}/config:/root/.config/bitmagnet
+    command:
+      - worker
+      - run
+      - --keys=http_server
+      - --keys=queue_server
+      - --keys=dht_crawler
+    depends_on:
+      postgres:
+        condition: service_healthy
