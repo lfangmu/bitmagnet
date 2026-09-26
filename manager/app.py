@@ -25,6 +25,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import ssl
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SSL_CTX = ssl._create_unverified_context()  # qBittorrent 现已启用自签 HTTPS
 
@@ -368,7 +369,7 @@ def _parse_size(s):
 
 
 def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="desc",
-               min_size=None, max_size=None, min_seeders=None):
+               min_size=None, max_size=None, min_seeders=None, hide_adult=None):
     """已索引种子列表：直读 Postgres，支持关键词 / 类型 / 排序 / 大小区间。"""
     try:
         limit = max(1, min(int(limit), 200))
@@ -381,13 +382,13 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     # 借此支持「按做种数排序」和「只看还有源的种子」，避免点到死种。
     seed_sub = ("(SELECT tc.seeders FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash "
                 "ORDER BY tc.seeders DESC NULLS LAST LIMIT 1)")
-    # 无关键词时「仅看有源」要对 33 万行逐行跑子查询（实测 >25s 超时并拖慢库），
-    # 故只在有关键词时生效；前端会在空搜索勾选时给出提示。
-    if min_seeders is not None and not q:
-        min_seeders = None
+    # 「仅看有源」改用 IN 子查询（单次扫描 torrent_contents，走 seeders 索引），
+    # 不再需要关键词，也没有相关子查询逐行执行的超时问题。
     if min_seeders is not None:
         try:
-            inner_where.append("COALESCE(%s,0) >= %d" % (seed_sub, max(0, int(min_seeders))))
+            n = max(0, int(min_seeders))
+            inner_where.append(
+                "tor.info_hash IN (SELECT info_hash FROM torrent_contents WHERE seeders >= %d)" % n)
         except Exception:
             pass
     if q:
@@ -396,10 +397,15 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     if ctype and q:
         c = ctype.replace("'", "''")
         if ctype in ("unknown", "未分类"):
-            inner_where.append("tor.info_hash NOT IN (SELECT info_hash FROM torrent_contents "
-                              "WHERE content_type IS NOT NULL AND content_type NOT IN ('unknown','未分类',''))")
+            inner_where.append("NOT EXISTS (SELECT 1 FROM torrent_contents tc "
+                              "WHERE tc.info_hash=tor.info_hash AND tc.content_type IS NOT NULL "
+                              "AND tc.content_type NOT IN ('unknown','未分类',''))")
         else:
             inner_where.append("tor.info_hash IN (SELECT info_hash FROM torrent_contents WHERE content_type = '%s')" % c)
+    if hide_adult:
+        inner_where.append(
+            "NOT EXISTS (SELECT 1 FROM torrent_contents tc "
+            "WHERE tc.info_hash=tor.info_hash AND tc.content_type = 'xxx')")
     if min_size is not None:
         inner_where.append("tor.size >= %d" % int(min_size))
     if max_size is not None:
@@ -408,7 +414,7 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     # 「按做种数排序」要对每行跑一次子查询再全表排序。33 万行下实测 >30s，
     # 且会拖慢/阻塞 DHT 爬虫写入（曾因此堵住 INSERT）。故仅在有过滤条件
     # （关键词/类型/大小/最少做种）时才启用，否则回退「最近更新」。
-    if sort == "seeders" and not inner_where:
+    if sort == "seeders" and not q:
         sort = "updated"
     if sort == "seeders":
         col = seed_sub
@@ -428,9 +434,12 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     )
     # statement_timeout 是安全底线：宁可报错也不让慢查询长时间占着库、
     # 阻塞 bitmagnet 的 DHT 写入。
+    # work_mem 必须显式抬高：默认仅 4MB，一旦「关键词 + 半连接」同时出现，
+    # 哈希表就溢出到磁盘，实测 25~90s 撞超时；给到 32MB 后同批查询全部 ~1s。
+    # 只作用于本 psql 会话，不动 bitmagnet 自身与全局配置。
     # -q 必须加：否则 SET 语句自身会输出 "SET" 污染结果，导致 JSON 解析失败
     txt = docker_exec(["psql", "-U", "postgres", "-d", "bitmagnet", "-tAqc",
-                       "SET statement_timeout='25s'; " + sql], timeout=40)
+                       "SET statement_timeout='25s'; SET work_mem='32MB'; " + sql], timeout=40)
     if txt is None:
         return {"ok": False, "error": "Postgres 查询失败"}
     txt = txt.strip()
@@ -723,6 +732,48 @@ def qbit_add_trackers(hashes):
         except Exception:
             pass
     return ok, None
+
+
+_RESCUE_LAST = {"ts": 0.0, "count": 0}
+AUTO_RESCUE = os.environ.get("AUTO_RESCUE", "1") == "1"
+
+
+def qbit_stalled():
+    """bitmagnet 分类里 state=stalledDL/metaDL 的种子（下载卡住）。"""
+    hdrs, _token, err = qbit_session()
+    if err:
+        return []
+    try:
+        url = QBIT_URL + "/api/v2/torrents/info?category=" + urllib.parse.quote(QBIT_CATEGORY)
+        req = urllib.request.Request(url, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
+            arr = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    return [{"hash": t.get("hash"), "name": t.get("name", "")}
+            for t in arr if t.get("state") in ("stalledDL", "metaDL") and t.get("hash")]
+
+
+def rescue_stalled():
+    """给 bitmagnet 分类里卡住的种子补 tracker，救活 stalledDL/metaDL。"""
+    stalled = qbit_stalled()
+    if not stalled:
+        return {"ok": True, "rescued": 0, "total": 0}
+    ok, err = qbit_add_trackers([x["hash"] for x in stalled])
+    _RESCUE_LAST["ts"] = time.time()
+    _RESCUE_LAST["count"] = ok
+    return {"ok": err is None, "rescued": ok, "total": len(stalled), "error": err}
+
+
+def _auto_rescue_loop():
+    time.sleep(120)
+    while True:
+        try:
+            if AUTO_RESCUE:
+                rescue_stalled()
+        except Exception:
+            pass
+        time.sleep(900)
 
 
 def qbit_session():
@@ -1285,6 +1336,7 @@ PAGE = r"""<!DOCTYPE html>
         <option value="asc">正序</option>
       </select>
       <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="idxAlive" style="width:auto;margin:0"> 仅看有源</label>
+      <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="idxHideXxx" style="width:auto;margin:0" checked> 隐藏成人</label>
       <span class="muted">大小≥</span><input id="idxMin" style="width:90px" placeholder="MB" inputmode="numeric">
       <span class="muted">≤</span><input id="idxMax" style="width:90px" placeholder="MB" inputmode="numeric">
       <span class="muted" id="idxCount"></span>
@@ -1325,6 +1377,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <label class="muted" style="align-self:center"><input type="checkbox" id="qAll" onchange="loadQueue()"> 显示全部（不限本台分类）</label>
       <span class="muted" style="align-self:center" id="qCount"></span>
+      <button id="qRescue" class="ghost">🚑 救援卡死种子</button>
     </div>
     <div class="toolbar" id="qToolbar" style="display:none">
       <span class="muted">已选 <b id="qSelN">0</b> 个</span>
@@ -1342,6 +1395,7 @@ PAGE = r"""<!DOCTYPE html>
   <!-- 收藏 -->
   <div class="panel" id="p-watch">
     <div class="row">
+      <button class="primary" onclick="downloadAllWatch()">下载全部收藏</button>
       <button class="ghost" onclick="clearWatch()">清空收藏</button>
       <span class="muted" id="watchCount"></span>
     </div>
@@ -1481,6 +1535,7 @@ async function loadIndexed(append){
   if(!isNaN(mn)&&mn>0) p.set("min_size", Math.floor(mn*1024*1024));
   if(!isNaN(mx)&&mx>0) p.set("max_size", Math.floor(mx*1024*1024));
   if($("#idxAlive") && $("#idxAlive").checked) p.set("min_seeders","1");
+  if($("#idxHideXxx") && $("#idxHideXxx").checked) p.set("hide_adult","1");
   const d=await jget("/api/indexed?"+p.toString());
   if(!d.ok){box.innerHTML='<div class="muted">❌ '+(d.error||"加载失败")+'</div>';$("#idxMore").disabled=false;$("#idxMore").textContent="加载更多";return;}
   idxItems=idxItems.concat(d.items||[]); idxOffset+=IDX_LIMIT;
@@ -1510,12 +1565,10 @@ function updateSelN(){
 $("#idxResults").addEventListener("change",e=>{ if(e.target.classList.contains("sel")) updateSelN(); });
 let _idxDeb;
 $("#idxTerm").addEventListener("input",()=>{ clearTimeout(_idxDeb); _idxDeb=setTimeout(()=>loadIndexed(false),300); });
-$("#idxType").addEventListener("change",renderIndexed);
+$("#idxType").addEventListener("change",()=>loadIndexed(false));
 $("#idxSort").addEventListener("change",()=>loadIndexed(false));
-if($("#idxAlive")) $("#idxAlive").addEventListener("change",()=>{
-  if($("#idxAlive").checked && !$("#idxTerm").value.trim()) toast("「仅看有源」需配合关键词使用");
-  loadIndexed(false);
-});
+if($("#idxAlive")) $("#idxAlive").addEventListener("change",()=>loadIndexed(false));
+if($("#idxHideXxx")) $("#idxHideXxx").addEventListener("change",()=>loadIndexed(false));
 $("#idxOrder").addEventListener("change",()=>loadIndexed(false));
 $("#idxMin").addEventListener("change",()=>loadIndexed(false));
 $("#idxMax").addEventListener("change",()=>loadIndexed(false));
@@ -1657,6 +1710,13 @@ $("#idxRefreshTr").onclick=async()=>{ const b=$("#idxRefreshTr"); b.disabled=tru
     if(d.ok) toast("✅ tracker 已刷新，共 "+d.count+" 个"+(d.sample&&d.sample[0]?"（例："+d.sample[0]+"）":""));
     else toast("❌ "+(d.error||"失败"));
   }catch(e){ toast("❌ "+e); } b.disabled=false; b.textContent=old; };
+$("#qRescue").onclick=async()=>{ const b=$("#qRescue"); b.disabled=true; const old=b.textContent; b.textContent="救援中…";
+  let ok=false;
+  try{ const d=await jget("/api/rescue");
+    if(d.ok){ ok=true; toast("🚑 已给 "+d.rescued+" 个卡住任务补 tracker"+(d.total?("（共 "+d.total+" 个）"):"")); }
+    else toast("❌ "+(d.error||"失败"));
+  }catch(e){ toast("❌ "+e); }
+  b.disabled=false; b.textContent=old; if(ok) loadQueue(); };
 $("#qBatchCat").onchange=()=>{ const cat=$("#qBatchCat").value; if(!cat) return; qBatch("setCategory",cat); $("#qBatchCat").value=""; };
 async function pasteDownload(){
   const txt=$("#pasteArea").value.trim();
@@ -1710,6 +1770,13 @@ function bindWatchActions(box){
   });
 }
 function clearWatch(){ if(!confirm("确认清空收藏？")) return; localStorage.removeItem("bm_watch"); renderWatch(); }
+async function downloadAllWatch(){
+  const w=getWatch(); if(!w.length){toast("收藏夹为空");return;}
+  if(!confirm("确认下载全部 "+w.length+" 个收藏？")) return;
+  let ok=0,fail=0;
+  for(const it of w){ const r=await download(it.magnet); if(r.ok)ok++;else fail++; }
+  toast("下载全部：成功 "+ok+" / 失败 "+fail); refreshDownloaded();
+}
 
 // ---- 系统状态 ----
 async function loadSystem(){
@@ -1858,15 +1925,20 @@ class H(BaseHTTPRequestHandler):
             min_size = params.get("min_size", [""])[0]
             max_size = params.get("max_size", [""])[0]
             min_seeders = params.get("min_seeders", [""])[0]
+            hide_adult = params.get("hide_adult", [""])[0] == "1"
             self._json(bm_indexed(
                 params.get("limit", ["50"])[0], params.get("offset", ["0"])[0],
                 params.get("q", [""])[0] or None, ctype, sort, order,
                 int(min_size) if min_size.isdigit() else None,
                 int(max_size) if max_size.isdigit() else None,
-                int(min_seeders) if min_seeders.isdigit() else None))
+                int(min_seeders) if min_seeders.isdigit() else None,
+                hide_adult))
             return
         if self.path.startswith("/api/trackers/refresh"):
             self._json(refresh_trackers())
+            return
+        if self.path.startswith("/api/rescue"):
+            self._json(rescue_stalled())
             return
         if self.path.startswith("/api/search"):
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1944,4 +2016,6 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print("[bitmagnet-bot] listening on :%d  (BitMagnet=%s, qBittorrent=%s, Clash=%s)"
           % (PORT, BITMAGNET_HOST, QBIT_URL, CLASH_API))
+    if AUTO_RESCUE:
+        threading.Thread(target=_auto_rescue_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
