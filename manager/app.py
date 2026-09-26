@@ -393,13 +393,13 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     if q:
         qe = str(q).replace("'", "''")
         inner_where.append("tor.name ILIKE '%%%s%%'" % qe)
-    if ctype:
-        ct_sub = ("(SELECT tc.content_type FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash "
-                  "ORDER BY tc.seeders DESC NULLS LAST LIMIT 1)")
+    if ctype and q:
+        c = ctype.replace("'", "''")
         if ctype in ("unknown", "未分类"):
-            inner_where.append("(%s IS NULL OR %s IN ('unknown','未分类',''))" % (ct_sub, ct_sub))
+            inner_where.append("tor.info_hash NOT IN (SELECT info_hash FROM torrent_contents "
+                              "WHERE content_type IS NOT NULL AND content_type NOT IN ('unknown','未分类',''))")
         else:
-            inner_where.append("%s = '%s'" % (ct_sub, ctype.replace("'", "''")))
+            inner_where.append("tor.info_hash IN (SELECT info_hash FROM torrent_contents WHERE content_type = '%s')" % c)
     if min_size is not None:
         inner_where.append("tor.size >= %d" % int(min_size))
     if max_size is not None:
@@ -676,6 +676,16 @@ def get_trackers():
     _TRACKER_CACHE["list"] = lst
     return lst
 
+
+def refresh_trackers():
+    """手动刷新 tracker 列表缓存（清空 12h TTL 后重新拉取）。"""
+    try:
+        _TRACKER_CACHE["list"] = []
+        _TRACKER_CACHE["ts"] = 0.0
+        lst = get_trackers()
+        return {"ok": True, "count": len(lst), "sample": lst[:3]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
 
 def with_trackers(magnet):
     """给 magnet 追加公共 tracker；原本就带 tr= 的原样返回。"""
@@ -1309,6 +1319,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="row" style="margin-top:8px">
         <button class="primary" onclick="pasteDownload()">提交下载</button>
         <span class="hint">直接发到 qBittorrent（分类 bitmagnet），无需先搜索</span>
+        <button id="idxRefreshTr" class="ghost">🔄 刷新 tracker 列表</button>
       </div>
     </div>
     <div class="row">
@@ -1462,7 +1473,10 @@ async function loadIndexed(append){
   const p=new URLSearchParams({limit:IDX_LIMIT, offset:idxOffset,
     sort:$("#idxSort").value, order:$("#idxOrder").value});
   if(term) p.set("q",term);
-  if($("#idxType").value) p.set("ctype",$("#idxType").value);
+  if($("#idxType").value){
+    if(term) p.set("ctype",$("#idxType").value);
+    else toast("类型筛选需配合关键词（已忽略）");
+  }
   const mn=parseFloat($("#idxMin").value), mx=parseFloat($("#idxMax").value);
   if(!isNaN(mn)&&mn>0) p.set("min_size", Math.floor(mn*1024*1024));
   if(!isNaN(mx)&&mx>0) p.set("max_size", Math.floor(mx*1024*1024));
@@ -1574,7 +1588,7 @@ async function loadQueue(){
       '<div style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;height:8px;overflow:hidden;margin-top:6px">'+
         '<div style="width:'+prog+'%;height:100%;background:var(--acc)"></div></div>'+
       '<div class="muted" style="font-size:12px;margin-top:4px">进度 '+prog+'% · 做种 '+(t.seeders||0)+' · 下载 '+(t.leechers||0)+'</div>'+
-      '<div class="acts"><input type="checkbox" class="qsel" data-qh="'+escAttr(t.hash)+'"> '+
+      '<div class="acts"><input type="checkbox" class="qsel" data-qh="'+escAttr(t.hash)+'" data-cat="'+escAttr(t.category||'')+'"> '+
         '<button data-act="pause" data-h="'+escAttr(t.hash)+'">暂停</button>'+
         '<button data-act="resume" data-h="'+escAttr(t.hash)+'">继续</button>'+
         '<button data-act="recheck" data-h="'+escAttr(t.hash)+'">校验</button>'+
@@ -1594,7 +1608,11 @@ const QSTATE={downloading:"下载中",stalledDL:"下载停滞",queuedDL:"排队�
 function bindQueueActions(box){
   box.querySelectorAll("button[data-act]").forEach(b=>{
     b.onclick=()=>{ const act=b.dataset.act, h=b.dataset.h;
-      if(act==="delete" && !confirm("确认从 qBittorrent 删除该任务？")) return;
+      if(act==="delete"){
+        const row=b.closest(".result"); const cat=row?row.getAttribute("data-cat"):"";
+        if(cat && cat!=="bitmagnet"){ toast("🚫 仅能删除本台(bitmagnet)任务，media 栈种子请在 media 面板管理"); return; }
+        if(!confirm("确认从 qBittorrent 删除该任务？")) return;
+      }
       qbitAction(act,h).then(d=>{ toast(d.ok?"已"+act:"失败："+(d.error||"")); if(d.ok) loadQueue(); });
     };
   });
@@ -1615,9 +1633,16 @@ function updateQSelN(){
 $("#queueResults").addEventListener("change",e=>{ if(e.target.classList.contains("qsel")) updateQSelN(); });
 $("#qSelAll").onclick=()=>{ document.querySelectorAll("#queueResults input.qsel").forEach(x=>x.checked=true); updateQSelN(); };
 async function qBatch(act,cat){
-  const hs=[...document.querySelectorAll("#queueResults input.qsel:checked")].map(x=>x.dataset.qh);
+  const sel=[...document.querySelectorAll("#queueResults input.qsel:checked")];
+  let hs=sel.map(x=>x.dataset.qh);
   if(!hs.length){toast("未选择任务");return;}
-  if(act==="delete" && !confirm("确认删除选中的 "+hs.length+" 个任务？")) return;
+  if(act==="delete"){
+    const blocked=sel.filter(x=>(x.dataset.cat||"")!=="bitmagnet");
+    if(blocked.length) toast("🚫 已跳过 "+blocked.length+" 个非 bitmagnet 任务（media 栈种子受保护）");
+    hs=sel.filter(x=>(x.dataset.cat||"")==="bitmagnet").map(x=>x.dataset.qh);
+    if(!hs.length){ toast("没有可删除的本台任务"); return; }
+    if(!confirm("确认删除选中的 "+hs.length+" 个 bitmagnet 任务？")) return;
+  }
   let ok=0,fail=0;
   for(const h of hs){ const d=await qbitAction(act,h,cat); if(d.ok)ok++;else fail++; }
   toast("批量"+act+"：成功 "+ok+" / 失败 "+fail);
@@ -1627,6 +1652,11 @@ async function qBatch(act,cat){
 $("#qBatchPause").onclick=()=>qBatch("pause");
 $("#qBatchResume").onclick=()=>qBatch("resume");
 $("#qBatchDel").onclick=()=>qBatch("delete");
+$("#idxRefreshTr").onclick=async()=>{ const b=$("#idxRefreshTr"); b.disabled=true; const old=b.textContent; b.textContent="刷新中…";
+  try{ const d=await jget("/api/trackers/refresh");
+    if(d.ok) toast("✅ tracker 已刷新，共 "+d.count+" 个"+(d.sample&&d.sample[0]?"（例："+d.sample[0]+"）":""));
+    else toast("❌ "+(d.error||"失败"));
+  }catch(e){ toast("❌ "+e); } b.disabled=false; b.textContent=old; };
 $("#qBatchCat").onchange=()=>{ const cat=$("#qBatchCat").value; if(!cat) return; qBatch("setCategory",cat); $("#qBatchCat").value=""; };
 async function pasteDownload(){
   const txt=$("#pasteArea").value.trim();
@@ -1834,6 +1864,9 @@ class H(BaseHTTPRequestHandler):
                 int(min_size) if min_size.isdigit() else None,
                 int(max_size) if max_size.isdigit() else None,
                 int(min_seeders) if min_seeders.isdigit() else None))
+            return
+        if self.path.startswith("/api/trackers/refresh"):
+            self._json(refresh_trackers())
             return
         if self.path.startswith("/api/search"):
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
