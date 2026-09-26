@@ -35,6 +35,10 @@ BITMAGNET_HOST = os.environ.get("BITMAGNET_HOST", "http://bitmagnet:3333").rstri
 QBIT_URL = os.environ.get("QBITTORRENT_URL", "").rstrip("/")
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "")
 QBIT_PASS = os.environ.get("QBITTORRENT_PASS", "")
+# 面板「系统状态」点开用的浏览器地址（免登优先）。内部调用仍用容器名/直连地址，
+# 两者分离：BITMAGNET_HOST 是容器内可达的 http://bitmagnet:3333，浏览器解析不了。
+PUB_BM_URL = os.environ.get("PUBLIC_BITMAGNET_URL", "")
+PUB_QB_URL = os.environ.get("PUBLIC_QBITTORRENT_URL", "")
 QBIT_CATEGORY = os.environ.get("QBITTORRENT_CATEGORY", "bitmagnet")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 # Clash / OpenClash 出网自愈（可选）：留空则不启用
@@ -364,7 +368,7 @@ def _parse_size(s):
 
 
 def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="desc",
-               min_size=None, max_size=None):
+               min_size=None, max_size=None, min_seeders=None):
     """已索引种子列表：直读 Postgres，支持关键词 / 类型 / 排序 / 大小区间。"""
     try:
         limit = max(1, min(int(limit), 200))
@@ -373,6 +377,19 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
         limit, offset = 50, 0
     inner_where = []
     params = []
+    # torrent_contents 存了真实做种数（bitmagnet 本体 torrents 表没有该列），
+    # 借此支持「按做种数排序」和「只看还有源的种子」，避免点到死种。
+    seed_sub = ("(SELECT tc.seeders FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash "
+                "ORDER BY tc.seeders DESC NULLS LAST LIMIT 1)")
+    # 无关键词时「仅看有源」要对 33 万行逐行跑子查询（实测 >25s 超时并拖慢库），
+    # 故只在有关键词时生效；前端会在空搜索勾选时给出提示。
+    if min_seeders is not None and not q:
+        min_seeders = None
+    if min_seeders is not None:
+        try:
+            inner_where.append("COALESCE(%s,0) >= %d" % (seed_sub, max(0, int(min_seeders))))
+        except Exception:
+            pass
     if q:
         qe = str(q).replace("'", "''")
         inner_where.append("tor.name ILIKE '%%%s%%'" % qe)
@@ -388,8 +405,17 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
     if max_size is not None:
         inner_where.append("tor.size <= %d" % int(max_size))
     iw = (" WHERE " + " AND ".join(inner_where)) if inner_where else ""
-    col = "tor.updated_at" if sort == "updated" else ("tor.size" if sort == "size" else "tor.name")
-    ob = "ASC" if order == "asc" else "DESC"
+    # 「按做种数排序」要对每行跑一次子查询再全表排序。33 万行下实测 >30s，
+    # 且会拖慢/阻塞 DHT 爬虫写入（曾因此堵住 INSERT）。故仅在有过滤条件
+    # （关键词/类型/大小/最少做种）时才启用，否则回退「最近更新」。
+    if sort == "seeders" and not inner_where:
+        sort = "updated"
+    if sort == "seeders":
+        col = seed_sub
+        ob = ("ASC" if order == "asc" else "DESC") + " NULLS LAST"
+    else:
+        col = "tor.updated_at" if sort == "updated" else ("tor.size" if sort == "size" else "tor.name")
+        ob = "ASC" if order == "asc" else "DESC"
     sql = (
         "SELECT json_agg(row_to_json(t)) FROM ("
         " SELECT encode(tor.info_hash,'hex') AS infohash, tor.name, tor.size,"
@@ -400,7 +426,11 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
         " ORDER BY " + col + " " + ob + " LIMIT %d OFFSET %d"
         ") t;" % (limit, offset)
     )
-    txt = docker_exec(["psql", "-U", "postgres", "-d", "bitmagnet", "-tAc", sql], timeout=40)
+    # statement_timeout 是安全底线：宁可报错也不让慢查询长时间占着库、
+    # 阻塞 bitmagnet 的 DHT 写入。
+    # -q 必须加：否则 SET 语句自身会输出 "SET" 污染结果，导致 JSON 解析失败
+    txt = docker_exec(["psql", "-U", "postgres", "-d", "bitmagnet", "-tAqc",
+                       "SET statement_timeout='25s'; " + sql], timeout=40)
     if txt is None:
         return {"ok": False, "error": "Postgres 查询失败"}
     txt = txt.strip()
@@ -587,6 +617,104 @@ def tmdb_enrich(items):
 # --------------------------------------------------------------------------- #
 # qBittorrent 客户端
 # --------------------------------------------------------------------------- #
+# --- tracker 注入 -----------------------------------------------------------
+# bitmagnet 产生的 magnet 只有 xt/dn/xl，不含 tr=。没有 tracker 时 qB 仅靠
+# DHT/PeX/LSD 找 peer，冷门/老种基本找不到源（seeds=0 -> stalledDL，永远不动）。
+# 故统一追加公共 tracker，这是「一键下载」能否真正跑起来的关键。
+TRACKER_LIST_URL = os.environ.get(
+    "TRACKER_LIST_URL",
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt")
+_TRACKER_CACHE = {"ts": 0.0, "list": []}
+_TRACKER_TTL = 12 * 3600
+# 兜底名单（拉取失败时用）。已剔除实测失效的 open.demonii.com / tracker.torrent.eu.org
+TRACKERS_FALLBACK = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.nyaa.vc:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.corpscorp.online:80/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.ducks.party:1984/announce",
+    "udp://tracker-udp.gbitt.info:80/announce",
+    "http://tracker.dler.org:6969/announce",
+    "udp://tracker2.dler.org:80/announce",
+    "http://tracker.dler.com:6969/announce",
+    "http://tracker.renfei.net:8080/announce",
+    "udp://tracker.peerfect.org:6969/announce",
+    "udp://tracker.opentrackr.com:6969/announce",
+    "udp://tracker.ilibr.org:6969/announce",
+    "udp://tracker.farted.net:6969/announce",
+    "udp://retracker01-msk-virt.corbina.net:80/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+]
+
+
+def get_trackers():
+    """公共 tracker 列表：优先在线拉取（经 TMDB_PROXY 出网），失败回落内置名单。缓存 12h。"""
+    now = time.time()
+    if _TRACKER_CACHE["list"] and (now - _TRACKER_CACHE["ts"]) < _TRACKER_TTL:
+        return _TRACKER_CACHE["list"]
+    lst = []
+    try:
+        handlers = []
+        if TMDB_PROXY:
+            handlers.append(urllib.request.ProxyHandler(
+                {"http": TMDB_PROXY, "https": TMDB_PROXY}))
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(TRACKER_LIST_URL, headers={"User-Agent": "bm-bot/1.0"})
+        with opener.open(req, timeout=20) as r:
+            body = r.read().decode("utf-8", "replace")
+        lst = [x.strip() for x in body.splitlines() if x.strip()]
+        lst = [x for x in lst if "demonii.com" not in x and "torrent.eu.org" not in x]
+    except Exception:
+        lst = []
+    if not lst:
+        lst = list(TRACKERS_FALLBACK)
+    _TRACKER_CACHE["ts"] = now
+    _TRACKER_CACHE["list"] = lst
+    return lst
+
+
+def with_trackers(magnet):
+    """给 magnet 追加公共 tracker；原本就带 tr= 的原样返回。"""
+    if not magnet.lower().startswith("magnet:") or "&tr=" in magnet.lower():
+        return magnet
+    try:
+        trs = get_trackers()
+    except Exception:
+        trs = []
+    if not trs:
+        return magnet
+    return magnet + "".join("&tr=" + urllib.parse.quote(t, safe="") for t in trs)
+
+
+def qbit_add_trackers(hashes):
+    """给已存在的种子补 tracker（救活 stalledDL 的任务）。返回 (ok_count, err_or_None)。"""
+    hdrs, _token, err = qbit_session()
+    if err:
+        return 0, err
+    trs = get_trackers()
+    if not trs:
+        return 0, "无可用 tracker"
+    h2 = dict(hdrs)
+    h2["Content-Type"] = "application/x-www-form-urlencoded"
+    urls = "\n".join(trs)
+    ok = 0
+    for h in hashes:
+        try:
+            body = urllib.parse.urlencode({"hash": h, "urls": urls}).encode()
+            req = urllib.request.Request(
+                QBIT_URL + "/api/v2/torrents/addTrackers", data=body, headers=h2)
+            with urllib.request.urlopen(req, timeout=20, context=SSL_CTX) as r:
+                r.read()
+            ok += 1
+        except Exception:
+            pass
+    return ok, None
+
+
 def qbit_session():
     """登录 qBittorrent v5，返回 (headers_dict, csrftoken_or_None, error_or_None)。"""
     try:
@@ -617,6 +745,7 @@ def qbit_add_magnet(magnet, category=QBIT_CATEGORY):
             magnet = "magnet:?xt=urn:btih:" + magnet.lower()
         else:
             return False, "无效的 magnet / infohash"
+    magnet = with_trackers(magnet)
     hdrs, _token, err = qbit_session()
     if err:
         return False, err
@@ -934,21 +1063,25 @@ def system_status():
     bm_h, bm_p = _host_port(BITMAGNET_HOST)
     qb_h, qb_p = _host_port(QBIT_URL) if QBIT_URL else (None, None)
     targets = [
-        ("BitMagnet 索引/隧道", bm_h, bm_p, "bitmagnet", BITMAGNET_HOST or None),
+        ("BitMagnet 索引/隧道", bm_h, bm_p, "bitmagnet", PUB_BM_URL or BITMAGNET_HOST or None),
         ("元数据库 Postgres", None, 5432, "bitmagnet-postgres", None),
-        ("qBittorrent 下载器", qb_h, qb_p, None, QBIT_URL or None),
+        ("qBittorrent 下载器", qb_h, qb_p, None, PUB_QB_URL or QBIT_URL or None),
     ]
     cons = get_containers()
     out = []
     for label, host, port, dname, url in targets:
-        tcp = tcp_ok(host, port)
+        # 未配 host（如 Postgres 只在容器网络内监听、端口未发布）时不探活，
+        # 否则 create_connection(None, ...) 必然失败会把在线服务误报成离线。
+        tcp = tcp_ok(host, port) if host else False
         d = cons.get(dname) if dname else None
         if d:
             running = d["state"] == "running"
             detail = "启动 %s" % fmt_uptime(d["created"])
-            ok = running and tcp
+            # 能查到容器时以容器状态为准；仅显式配了 host 才叠加 TCP 探活
+            ok = running and (tcp if host else True)
         else:
-            detail = "端口 %d" % port
+            # port 可能为 None（如未配置 qBittorrent），不能直接用 %d 格式化
+            detail = ("端口 %d" % port) if port else "未配置"
             ok = tcp
         out.append({
             "label": label, "ok": ok, "tcp": tcp,
@@ -1112,29 +1245,6 @@ PAGE = r"""<!DOCTYPE html>
     <div class="tab" data-p="queue">📥 下载队列</div>
     <div class="tab" data-p="watch">❤️ 收藏</div>
     <div class="tab" data-p="status">📊 系统状态</div>
-    <div class="tab" data-p="config">🛠 配置</div>
-  </div>
-
-  <!-- 配置：BitMagnet 单一配置点 -->
-  <div class="panel" id="p-config">
-    <div class="row" style="align-items:center">
-      <h3 style="margin:0">⚙ BitMagnet 配置</h3>
-      <span class="muted" id="cfgStatus"></span>
-    </div>
-    <p class="muted">统一配置点（对应本工程 <code>.env</code>）。保存后自动写盘并在后台触发 <code>docker compose up -d</code>，无需再 SSH 改文件。仅 TMDB 相关项可在此编辑；Clash / 出网等环境专属配置不在公共模板内。</p>
-    <div class="card">
-      <h4>TMDB 元数据 enrichment</h4>
-      <label>TMDB_API_KEY（影视海报/年份/类型）</label>
-      <input id="cfg_TMDB_API_KEY" type="password" placeholder="你的 TMDB v3 API Key">
-      <label>TMDB_ENABLED（填 true 启用 enrichment）</label>
-      <input id="cfg_TMDB_ENABLED" placeholder="true / false">
-      <label>TMDB_PROXY（可选，TMDB 出网代理）</label>
-      <input id="cfg_TMDB_PROXY" placeholder="http://proxy:3128">
-    </div>
-    <div class="row">
-      <button id="cfgSave" class="btn">保存并应用</button>
-      <button id="cfgReload" class="btn ghost">重新读取</button>
-    </div>
   </div>
 
   <!-- 已索引种子 -->
@@ -1156,6 +1266,7 @@ PAGE = r"""<!DOCTYPE html>
       </select>
       <select id="idxSort">
         <option value="updated">最近更新</option>
+        <option value="seeders">做种数（有源优先）</option>
         <option value="size">大小</option>
         <option value="name">名称</option>
       </select>
@@ -1163,6 +1274,7 @@ PAGE = r"""<!DOCTYPE html>
         <option value="desc">倒序</option>
         <option value="asc">正序</option>
       </select>
+      <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="idxAlive" style="width:auto;margin:0"> 仅看有源</label>
       <span class="muted">大小≥</span><input id="idxMin" style="width:90px" placeholder="MB" inputmode="numeric">
       <span class="muted">≤</span><input id="idxMax" style="width:90px" placeholder="MB" inputmode="numeric">
       <span class="muted" id="idxCount"></span>
@@ -1234,7 +1346,6 @@ PAGE = r"""<!DOCTYPE html>
       <div id="egressBody" class="m"></div>
       <div class="row" style="margin-top:8px">
         <button onclick="loadEgress()">测试</button>
-        <button class="primary" id="fixEgressBtn" onclick="fixEgress()">🔧 一键修复</button>
       </div>
     </div>
     <div class="card" style="margin-top:14px">
@@ -1315,10 +1426,14 @@ function cardHtml(it, opts){
   }
   const poster = it.poster ? '<img src="'+escAttr(it.poster)+'" onerror="this.style.display=\'none\'" loading="lazy" style="width:54px;height:80px;object-fit:cover;border-radius:6px;float:left;margin:0 10px 6px 0">':'';
   const year = it.year?(' ('+it.year+')'):'';
+  let seedBadge;
+  if(it.seeders==null) seedBadge='做种 <span class="badge">未知</span>';
+  else if(it.seeders>0) seedBadge='做种 <span class="badge b-up">'+it.seeders+'</span>';
+  else seedBadge='做种 <span class="badge b-down">0 无源</span>';
   return '<div class="result" style="overflow:hidden">'+
     poster+
     '<div class="t">'+(it.title||it.name||"(无标题)")+year+'</div>'+
-    '<div class="m">类型 <span class="badge b-warn">'+ctLabel+'</span> · 大小 '+size+' · 做种 '+seed+' · 下载 '+leec+'</div>'+
+    '<div class="m">类型 <span class="badge b-warn">'+ctLabel+'</span> · 大小 '+size+' · '+seedBadge+' · 下载 '+leec+'</div>'+
     '<div class="acts">'+acts+'</div></div>';
 }
 
@@ -1351,6 +1466,7 @@ async function loadIndexed(append){
   const mn=parseFloat($("#idxMin").value), mx=parseFloat($("#idxMax").value);
   if(!isNaN(mn)&&mn>0) p.set("min_size", Math.floor(mn*1024*1024));
   if(!isNaN(mx)&&mx>0) p.set("max_size", Math.floor(mx*1024*1024));
+  if($("#idxAlive") && $("#idxAlive").checked) p.set("min_seeders","1");
   const d=await jget("/api/indexed?"+p.toString());
   if(!d.ok){box.innerHTML='<div class="muted">❌ '+(d.error||"加载失败")+'</div>';$("#idxMore").disabled=false;$("#idxMore").textContent="加载更多";return;}
   idxItems=idxItems.concat(d.items||[]); idxOffset+=IDX_LIMIT;
@@ -1382,6 +1498,10 @@ let _idxDeb;
 $("#idxTerm").addEventListener("input",()=>{ clearTimeout(_idxDeb); _idxDeb=setTimeout(()=>loadIndexed(false),300); });
 $("#idxType").addEventListener("change",renderIndexed);
 $("#idxSort").addEventListener("change",()=>loadIndexed(false));
+if($("#idxAlive")) $("#idxAlive").addEventListener("change",()=>{
+  if($("#idxAlive").checked && !$("#idxTerm").value.trim()) toast("「仅看有源」需配合关键词使用");
+  loadIndexed(false);
+});
 $("#idxOrder").addEventListener("change",()=>loadIndexed(false));
 $("#idxMin").addEventListener("change",()=>loadIndexed(false));
 $("#idxMax").addEventListener("change",()=>loadIndexed(false));
@@ -1587,15 +1707,8 @@ async function loadEgress(){
   const d=await jget("/api/egress");
   if(d.error){el.innerHTML='<span class="badge b-down">异常</span> '+d.error;return;}
   el.innerHTML = (d.ok?'<span class="badge b-up">出网正常</span>':'<span class="badge b-down">出网异常</span>')
-    + ' · 当前节点 <b>'+escHtml(d.node||'?')+'</b>'
+    + (d.node?(' · 当前节点 <b>'+escHtml(d.node)+'</b>'):'')
     + (d.latency!=null?' · 延迟 '+d.latency+'ms':'') + (d.error&&!d.ok?' · '+escHtml(d.error):'');
-}
-async function fixEgress(){
-  $("#fixEgressBtn").disabled=true; $("#fixEgressBtn").textContent="修复中…";
-  const d=await jpost("/api/egress/fix",{});
-  $("#fixEgressBtn").disabled=false; $("#fixEgressBtn").textContent="🔧 一键修复";
-  toast(d.ok?("已钉到 "+d.pinned):("修复失败: "+(d.error||"")));
-  loadEgress();
 }
 async function loadTunnel(){
   const el=$("#tunnelBody"); el.innerHTML='<span class="muted">检测中…</span>';
@@ -1664,36 +1777,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   else if(p==="queue"){loadQueue();}
   else if(p==="watch"){renderWatch();}
   else if(p==="search"){renderHistory();}
-  else if(p==="config"){loadConfig();}
 });
-
-// 配置 Tab：读取 / 保存 出网与 Clash 单一配置点
-function loadConfig(){
-  jget("/api/config").then(d=>{
-    if(!d.ok){ $("#cfgStatus").textContent="读取失败"; return; }
-    const b=d.bitmagnet||{};
-    $("#cfg_TMDB_API_KEY").value=b.TMDB_API_KEY||"";
-    $("#cfg_TMDB_ENABLED").value=b.TMDB_ENABLED||"";
-    $("#cfg_TMDB_PROXY").value=b.TMDB_PROXY||"";
-    $("#cfgStatus").textContent="已加载";
-  }).catch(()=>{ $("#cfgStatus").textContent="读取失败"; });
-}
-function saveConfig(){
-  const payload={
-    bitmagnet:{
-      TMDB_API_KEY:$("#cfg_TMDB_API_KEY").value.trim(),
-      TMDB_ENABLED:$("#cfg_TMDB_ENABLED").value.trim(),
-      TMDB_PROXY:$("#cfg_TMDB_PROXY").value.trim()
-    }
-  };
-  $("#cfgStatus").textContent="保存中…";
-  jpost("/api/config",payload).then(d=>{
-    if(d && d.ok){ $("#cfgStatus").textContent="✅ "+(d.message||"已应用")+"  变更: "+JSON.stringify(d.changed||{}); }
-    else { $("#cfgStatus").textContent="❌ "+((d&&d.error)||"失败"); }
-  }).catch(()=>{ $("#cfgStatus").textContent="❌ 请求失败"; });
-}
-if($("#cfgSave")) $("#cfgSave").onclick=saveConfig;
-if($("#cfgReload")) $("#cfgReload").onclick=loadConfig;
 
 // 队列 Tab：每 5s 自动刷新（用户有选中时不打断）；状态 Tab：每 15s 拉一次
 setInterval(()=>{ if(activePanel==="queue" && $("#qToolbar").style.display==="none") loadQueue(); }, 5000);
@@ -1735,7 +1819,7 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(q)
             sort = params.get("sort", ["updated"])[0]
-            if sort not in ("updated", "size", "name"):
+            if sort not in ("updated", "size", "name", "seeders"):
                 sort = "updated"
             order = params.get("order", ["desc"])[0]
             if order not in ("asc", "desc"):
@@ -1743,11 +1827,13 @@ class H(BaseHTTPRequestHandler):
             ctype = params.get("ctype", [""])[0] or None
             min_size = params.get("min_size", [""])[0]
             max_size = params.get("max_size", [""])[0]
+            min_seeders = params.get("min_seeders", [""])[0]
             self._json(bm_indexed(
                 params.get("limit", ["50"])[0], params.get("offset", ["0"])[0],
                 params.get("q", [""])[0] or None, ctype, sort, order,
                 int(min_size) if min_size.isdigit() else None,
-                int(max_size) if max_size.isdigit() else None))
+                int(max_size) if max_size.isdigit() else None,
+                int(min_seeders) if min_seeders.isdigit() else None))
             return
         if self.path.startswith("/api/search"):
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)

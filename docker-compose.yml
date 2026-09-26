@@ -89,10 +89,16 @@ services:
       # 容器内挂载路径（见 volumes）
       - BITMAGNET_ENV_FILE=/host/bitmagnet/.env
       - BITMAGNET_COMPOSE_FILE=/host/bitmagnet/docker-compose.yml
+      # 面板展示用（浏览器可点开、免登）；不参与容器内部调用
+      - PUBLIC_BITMAGNET_URL=${PUBLIC_BITMAGNET_URL:-}
+      - PUBLIC_QBITTORRENT_URL=${PUBLIC_QBITTORRENT_URL:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./.env:/host/bitmagnet/.env
       - ./docker-compose.yml:/host/bitmagnet/docker-compose.yml:ro
+      # 代码热重载：改 manager/app.py 后 restart 容器即生效，无需重新 build 镜像
+      # （build 需 curl download.docker.com / github.com，NAS 直连被墙）
+      - ./manager/app.py:/app/app.py:ro
     depends_on:
       bitmagnet:
         condition: service_started
