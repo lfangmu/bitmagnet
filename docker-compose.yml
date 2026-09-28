@@ -42,7 +42,13 @@ services:
       # 填了 TMDB_API_KEY 时请改为 true 以启用海报/年份/类型匹配。
       - TMDB_ENABLED=${TMDB_ENABLED:-false}
       # 可选：TMDB API Key 开启影视元数据 enrichment
-      # TMDB_API_KEY=
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      # 出网代理：容器无直连外网（api.themoviedb.org 只解析出 IPv6，容器无 IPv6 路由），
+      # bitmagnet 也没有专用的 proxy 配置项，故依赖 Go 标准库对 HTTP(S)_PROXY 的支持。
+      # 已实测：容器内经 squid 访问 http://api.themoviedb.org → 401（= 请求确实到达 TMDB）。
+      - HTTP_PROXY=${TMDB_PROXY:-}
+      - HTTPS_PROXY=${TMDB_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,postgres,172.18.0.0/16,192.168.68.0/24
     ports:
       - "${WEB_PORT:-3333}:3333"   # Web UI / GraphQL API / Torznab 同源
       - "3334:3334/tcp"            # DHT（TCP）

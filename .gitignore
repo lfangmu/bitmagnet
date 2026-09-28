@@ -3,3 +3,8 @@ data/
 *.log
 __pycache__/
 *.pyc
+
+# 备份文件不入库
+*.bak
+*.bak-*
+*.bak.*
