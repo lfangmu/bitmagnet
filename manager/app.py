@@ -1206,20 +1206,75 @@ def _ov_trend(txt):
     return tr or None
 
 
+def _ov_mcv(txt):
+    """解析 pg_stats 输出的 '{v1,v2}|{f1,f2}|null_frac' 三列。"""
+    if not txt:
+        return None
+    for line in txt.strip().splitlines():
+        if line.count("|") < 2:
+            continue
+        p = line.split("|")
+        vals = [v for v in p[0].strip().strip("{}").split(",") if v.strip() != ""]
+        freqs = []
+        for f in p[1].strip().strip("{}").split(","):
+            f = f.strip()
+            if not f:
+                continue
+            try:
+                freqs.append(float(f))
+            except ValueError:
+                return None
+        try:
+            nf = float(p[2].strip())
+        except ValueError:
+            return None
+        if not vals or len(vals) != len(freqs):
+            return None
+        return (vals, freqs, nf)
+    return None
+
+
+def _ov_ctype_stats(txt):
+    """content_type 分布：返回 ([(type, frac)], null_frac)；frac 是全表行占比。"""
+    m = _ov_mcv(txt)
+    if not m:
+        return None
+    vals, freqs, nf = m
+    return (list(zip(vals, freqs)), nf)
+
+
+def _ov_nosrc_stats(txt):
+    """无源占比（%）：与原始语义 coalesce(seeders,0)=0 一致——seeders=0 与 NULL 都算无源。"""
+    m = _ov_mcv(txt)
+    if not m:
+        return None
+    vals, freqs, nf = m
+    if "0" not in vals:
+        return None
+    return (freqs[vals.index("0")] + nf) * 100.0
+
+
 def _ov_worker():
     """常驻后台：逐个采集指标；爬虫写入致聚合饥饿时，空闲窗口自动补齐。
     失败指标 10 分钟内退避，避免持续空耗 I/O。"""
     specs = [
         ("total", "SELECT count(*) FROM torrents", 20, lambda t: _ov_int(t), 60),
-        ("content_type",
-         "SELECT COALESCE(content_type,'unknown') AS ct, count(*) FROM torrent_contents GROUP BY ct ORDER BY 2 DESC",
-         30, lambda t: _ov_parse_dist(t), 300),
+        # torrent_contents 在爬虫持续写入下几乎不可读：实测全表 count(*) 60s 超时、
+        # 2% 块级抽样 40s 仍超时（该表正是爬虫 8 分钟批量 INSERT 的目标）。
+        # torrents 表则可读，files_status 用 2% 块级抽样即可。
+        # content_type / no_source 改走 pg_stats（ANALYZE 产出的统计信息）：零表 I/O、
+        # 亚秒返回、永远成功。MCV 频率是"全表行占比"，可直接换算成绝对数。
+        ("ctype_stats",
+         "SELECT most_common_vals::text, most_common_freqs::text, null_frac FROM pg_stats "
+         "WHERE schemaname='public' AND tablename='torrent_contents' AND attname='content_type'",
+         15, lambda t: _ov_ctype_stats(t), 300),
         ("files_status",
-         "SELECT files_status, count(*) FROM torrents GROUP BY files_status ORDER BY 2 DESC",
+         "SELECT files_status, count(*) FROM torrents TABLESAMPLE SYSTEM (2) GROUP BY 1 ORDER BY 2 DESC",
          20, lambda t: _ov_fs(t), 300),
         ("no_source",
-         "SELECT count(*) FROM torrent_contents WHERE coalesce(seeders,0)=0",
-         20, lambda t: _ov_int(t), 300),
+         "SELECT most_common_vals::text, most_common_freqs::text, null_frac FROM pg_stats "
+         "WHERE schemaname='public' AND tablename='torrent_contents' AND attname='seeders'",
+         15, lambda t: _ov_nosrc_stats(t), 300),
         ("new_24h",
          "SELECT count(*) FROM torrents WHERE updated_at > now()-interval '24 hours'",
          20, lambda t: _ov_int(t), 300),
@@ -1255,30 +1310,46 @@ def _ov_worker():
                     continue
                 upd = {}
                 if key == "total":
-                    pt = _OVERVIEW.get("_prev_total")
-                    pts = _OVERVIEW.get("_prev_ts", 0)
-                    if pt is not None and pts:
-                        hrs = (now - pts) / 3600.0
-                        if hrs > 0.002:
-                            upd["ingest_rate"] = round((val - pt) / hrs, 1)
-                    _OVERVIEW["_prev_total"] = val
-                    _OVERVIEW["_prev_ts"] = now
                     upd["total"] = val
-                elif key == "content_type":
-                    dist, unc, tot = val
-                    upd["content_type"] = dist
-                    upd["total_contents"] = tot
-                    upd["unclassified"] = unc
-                    upd["classified_ratio"] = round((1 - unc / tot) * 100, 1) if tot else None
+                elif key == "ctype_stats":
+                    dist, nf = val
+                    base = (_OVERVIEW["data"] or {}).get("total")
+                    items = [{"type": t, "count": int(round(f * base))}
+                             for t, f in dist] if base else []
+                    if base and nf > 0:
+                        items.append({"type": "unknown", "count": int(round(nf * base))})
+                    items.sort(key=lambda x: -x["count"])
+                    upd["content_type"] = items
+                    upd["total_contents"] = base
+                    upd["unclassified"] = int(round(nf * base)) if base else None
+                    cr = round((1 - nf) * 100, 1)
+                    upd["classified_ratio"] = cr
+                    # 分类上限（估）：NULL 桶中仅约 20% 属影视、可被 TMDB 匹配，
+                    # 其余永远无法分类。用来说明"已分类占比"的天花板。
+                    upd["classify_ceiling"] = round(cr + 0.2 * nf * 100, 1)
+                    upd["content_type_est"] = True
                 elif key == "files_status":
-                    upd["files_status"] = val
+                    ssum = sum(x["count"] for x in val) or 1
+                    base = (_OVERVIEW["data"] or {}).get("total")
+                    k = (base / float(ssum)) if base else 1.0
+                    upd["files_status"] = [{"status": x["status"],
+                                            "count": int(round(x["count"] * k))} for x in val]
+                    upd["files_status_est"] = True
                 elif key == "no_source":
-                    upd["no_source"] = val
-                    tc = (_OVERVIEW["data"] or {}).get("total_contents")
-                    if tc:
-                        upd["no_source_ratio"] = round(val / tc * 100, 1)
+                    ratio = val
+                    upd["no_source_ratio"] = round(ratio, 1)
+                    base = (_OVERVIEW["data"] or {}).get("total")
+                    if base:
+                        upd["no_source"] = int(round(ratio / 100.0 * base))
+                    upd["no_source_est"] = True
                 else:
                     upd[key] = val
+                    if key == "hourly" and isinstance(val, list) and len(val) >= 3:
+                        # 摄取速率改由"完整小时桶"均值推导：首桶与末桶都是未走完的小时，剔除。
+                        # 比原先"两次 total 采样求差"稳健——后者在采样抖动下会算成 0。
+                        buckets = [x["count"] for x in val[1:-1]] or [x["count"] for x in val]
+                        if buckets:
+                            upd["ingest_rate"] = round(sum(buckets) / float(len(buckets)), 1)
                 _ov_setmany(upd, now)
                 with _OV_LOCK:
                     _OV_TS[key] = now
@@ -2251,6 +2322,7 @@ function loadOverview(){
     if(d.new_7d!=null) cards.push(["7d 新增", d.new_7d.toLocaleString()]);
     if(d.ingest_rate!=null) cards.push(["摄取速率", d.ingest_rate.toLocaleString()+"/h"]);
     if(d.classified_ratio!=null) cards.push(["已分类占比", d.classified_ratio+"%"]);
+    if(d.classify_ceiling!=null) cards.push(["分类上限(估)", d.classify_ceiling+"%"]);
     if(d.no_source_ratio!=null) cards.push(["无源占比", d.no_source_ratio+"%"]);
     if(cards.length){
       h+='<div class="ov-cards">';
@@ -2259,7 +2331,7 @@ function loadOverview(){
     }
     if(d.content_type && d.content_type.length){
       const max=Math.max.apply(null, d.content_type.map(x=>x.count));
-      h+='<h4>内容类型分布</h4><div class="ov-bars">';
+      h+='<h4>内容类型分布'+(d.content_type_est?'（统计估算）':'')+'</h4><div class="ov-bars">';
       for(const x of d.content_type.slice(0,12)){
         const pct=max?Math.round(x.count/max*100):0;
         const label=x.type==="unknown"?"未分类":x.type;
@@ -2271,7 +2343,7 @@ function loadOverview(){
     }
     if(d.files_status && d.files_status.length){
       const map={"multi":"多文件","single":"单文件","no_info":"无信息","over_threshold":"超阈值(>100)"};
-      h+='<h4>文件清单状态</h4><div class="ov-chips">';
+      h+='<h4>文件清单状态'+(d.files_status_est?'（2% 抽样估算）':'')+'</h4><div class="ov-chips">';
       for(const x of d.files_status)
         h+='<span class="chip">'+escHtml(map[x.status]||x.status)+'：'+x.count.toLocaleString()+'</span>';
       h+='</div>';
