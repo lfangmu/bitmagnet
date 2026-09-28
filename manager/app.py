@@ -319,9 +319,9 @@ def get_containers():
     return out
 
 
-def docker_exec(cmd, timeout=40):
-    """在 bitmagnet-postgres 跑 psql；返回解析后的文本（demux 后）。"""
-    status, body = docker_api("POST", "/containers/bitmagnet-postgres/exec",
+def docker_exec(cmd, timeout=40, container="bitmagnet-postgres"):
+    """在指定容器跑命令（默认 bitmagnet-postgres 跑 psql）；返回解析后的文本（demux 后）。"""
+    status, body = docker_api("POST", "/containers/%s/exec" % container,
                               json.dumps({"Cmd": cmd, "AttachStdout": True, "AttachStderr": True}),
                               timeout=timeout)
     if status != 201:
@@ -1034,6 +1034,7 @@ def egress_probe():
     """探测当前出网：bot 容器被 fnOS 防火墙挡住、无法直连 Clash API，
     故经宿主 squid 代理测 generate_204（squid 能出网即代表出网通）。结果缓存 30s。"""
     now = time.time()
+    _egr_maybe_snapshot(now)
     if now - _EGRESS_CACHE["ts"] < 30 and _EGRESS_CACHE["val"] is not None:
         return _EGRESS_CACHE["val"]
     node = _clash_node()
@@ -1054,6 +1055,105 @@ def egress_probe():
     _EGRESS_CACHE["ts"] = now
     _EGRESS_CACHE["val"] = val
     return val
+
+
+# ---- 出网延迟趋势：采样 squid access.log 的 CONNECT 耗时 ----
+# squid 的 CONNECT 耗时是判断跨境出网质量的最佳单一指标：健康 ~350ms，
+# 劣化时变成 ~5005ms 且隧道内 TLS 直接断（TMDB、autopilot、FlareSolverr 会一起挂）。
+# 采样落在与库概览同一个 sqlite 里，零 bitmagnet 库负载。
+_EGR_INTERVAL = 300          # 每 5 分钟采样一次
+_EGR_LAST = 0
+_EGR_LOCK = threading.Lock()
+
+
+def _egr_init():
+    try:
+        con = sqlite3.connect(_HIST_DB, timeout=10)
+        con.execute("CREATE TABLE IF NOT EXISTS egress_snap ("
+                    "ts INTEGER PRIMARY KEY, n INTEGER, med REAL, p95 REAL, mx REAL)")
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _egr_sample_once():
+    """经 squid 主动探测 generate_204，返回 (n, med, p95, mx) 毫秒；全部失败返回 None。
+
+    不用 squid 日志里的 TCP_TUNNEL 时长：那条记的是**隧道存活时间**（实测 75~79s 很常见），
+    不是建连延迟，混进去会让"延迟"完全失真。主动探测才是可跨时间比较的口径。
+    """
+    vals = []
+    handlers = []
+    if TMDB_PROXY:
+        handlers.append(urllib.request.ProxyHandler(
+            {"http": TMDB_PROXY, "https": TMDB_PROXY}))
+    opener = urllib.request.build_opener(*handlers)
+    for _ in range(3):
+        t0 = time.time()
+        try:
+            with opener.open(urllib.request.Request(
+                    "http://www.google.com/generate_204"), timeout=8) as r:
+                if r.status == 204:
+                    vals.append((time.time() - t0) * 1000.0)
+        except Exception:
+            pass
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    return (n, vals[n // 2], vals[max(0, int(n * 0.95) - 1)], vals[-1])
+
+
+def _egr_maybe_snapshot(now):
+    """到点就在后台线程采样：探测可能耗时数十秒，绝不能阻塞 /api/egress 的响应。"""
+    global _EGR_LAST
+    if now - _EGR_LAST < _EGR_INTERVAL:
+        return
+    _EGR_LAST = now          # 先占位，防止并发重复触发
+
+    def _run():
+        _egr_init()
+        s = _egr_sample_once()
+        if not s:
+            return
+        try:
+            with _EGR_LOCK:
+                con = sqlite3.connect(_HIST_DB, timeout=10)
+                con.execute("INSERT OR REPLACE INTO egress_snap VALUES (?,?,?,?,?)",
+                            (int(now),) + s)
+                con.execute("DELETE FROM egress_snap WHERE ts < ?",
+                            (int(now) - 7 * 86400,))
+                con.commit()
+                con.close()
+        except Exception:
+            return
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def egress_history(hours=24):
+    """出网延迟历史（squid CONNECT 耗时中位数）。"""
+    try:
+        hours = int(hours)
+    except Exception:
+        hours = 24
+    if hours not in (6, 24, 72):
+        hours = 24
+    cutoff = int(time.time()) - hours * 3600
+    pts = []
+    try:
+        with _EGR_LOCK:
+            con = sqlite3.connect(_HIST_DB, timeout=10)
+            cur = con.execute(
+                "SELECT ts,n,med,p95,mx FROM egress_snap WHERE ts>=? ORDER BY ts", (cutoff,))
+            for r in cur.fetchall():
+                pts.append({"ts": r[0], "n": r[1], "med": r[2], "p95": r[3], "mx": r[4]})
+            con.close()
+    except Exception:
+        return {"ok": True, "available": False, "points": [], "hours": hours}
+    return {"ok": True, "available": True, "points": pts, "hours": hours}
 
 
 def fix_egress():
@@ -2308,7 +2408,27 @@ async function loadEgress(){
   if(d.error){el.innerHTML='<span class="badge b-down">异常</span> '+d.error;return;}
   el.innerHTML = (d.ok?'<span class="badge b-up">出网正常</span>':'<span class="badge b-down">出网异常</span>')
     + (d.node?(' · 当前节点 <b>'+escHtml(d.node)+'</b>'):'')
-    + (d.latency!=null?' · 延迟 '+d.latency+'ms':'') + (d.error&&!d.ok?' · '+escHtml(d.error):'');
+    + (d.latency!=null?' · 延迟 '+d.latency+'ms':'') + (d.error&&!d.ok?' · '+escHtml(d.error):'')
+    + '<div id="egressTrend" class="muted" style="margin-top:6px">出网延迟趋势加载中…</div>';
+  loadEgressTrend();
+}
+async function loadEgressTrend(){
+  const el=$("#egressTrend"); if(!el) return;
+  try{
+    const r=await jget("/api/egress/history?hours=24");
+    const pts=r.points||[];
+    if(pts.length<2){ el.textContent="出网延迟趋势：采样中（每 5 分钟一次，当前 "+pts.length+" 点）"; return; }
+    const vals=pts.map(x=>Math.round(x.med));
+    const mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals);
+    const w=600,hh=50,n=vals.length,step=n>1?w/(n-1):w;
+    let pth="";
+    vals.forEach((v,i)=>{ const x=i*step, y=hh-((v-mn)/((mx-mn)||1))*hh; pth+=(i?"L":"M")+x.toFixed(1)+" "+y.toFixed(1)+" "; });
+    el.innerHTML='出网探测延迟趋势（24h，经 squid 主动探测 generate_204）'+
+      '<svg viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" class="ov-spark" style="height:50px">'+
+      '<path d="'+pth+'" fill="none" stroke="var(--acc)" stroke-width="2"/></svg>'+
+      '<div class="muted">'+mn+'ms ~ '+mx+'ms ｜ 最新 '+vals[vals.length-1]+'ms ｜ '+n+
+      ' 点（持续 >1500ms 通常意味着跨境出网劣化）</div>';
+  }catch(e){ el.textContent="出网趋势加载失败"; }
 }
 async function loadTunnel(){
   const el=$("#tunnelBody"); el.innerHTML='<span class="muted">检测中…</span>';
@@ -2552,6 +2672,15 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/queue"):
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._json(qbit_queue(show_all=(params.get("all", ["0"])[0] == "1")))
+            return
+        if self.path.startswith("/api/egress/history"):
+            hrs = 24
+            try:
+                qs = urllib.parse.urlparse(self.path).query
+                hrs = int(urllib.parse.parse_qs(qs).get("hours", ["24"])[0])
+            except Exception:
+                hrs = 24
+            self._json(egress_history(hrs))
             return
         if self.path.startswith("/api/egress"):
             self._json(egress_probe())
