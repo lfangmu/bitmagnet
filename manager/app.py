@@ -424,7 +424,7 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
         ob = "ASC" if order == "asc" else "DESC"
     sql = (
         "SELECT json_agg(row_to_json(t)) FROM ("
-        " SELECT encode(tor.info_hash,'hex') AS infohash, tor.name, tor.size,"
+        " SELECT encode(tor.info_hash,'hex') AS infohash, tor.name, tor.size, tor.files_count,"
         " (SELECT tc.content_type FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash ORDER BY tc.seeders DESC NULLS LAST LIMIT 1) AS content_type,"
         " (SELECT tc.seeders FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash ORDER BY tc.seeders DESC NULLS LAST LIMIT 1) AS seeders,"
         " (SELECT tc.leechers FROM torrent_contents tc WHERE tc.info_hash=tor.info_hash ORDER BY tc.seeders DESC NULLS LAST LIMIT 1) AS leechers"
@@ -458,6 +458,7 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
             "infohash": ih,
             "name": r.get("name", ""),
             "size": r.get("size", 0),
+            "files_count": r.get("files_count"),
             "content_type": r.get("content_type") or "未分类",
             "seeders": r.get("seeders"),
             "leechers": r.get("leechers"),
@@ -465,6 +466,70 @@ def bm_indexed(limit=50, offset=0, q=None, ctype=None, sort="updated", order="de
         })
     tmdb_enrich(items)
     return {"ok": True, "count": len(items), "items": items}
+
+
+def bm_files(infohash):
+    """种子文件列表：直读 torrent_files（(info_hash,index) 唯一索引，单种子约 0.2s）。
+
+    bitmagnet 的 files_status 是枚举 FilesStatus，取值与含义：
+      multi          多文件，torrent_files 存有完整清单
+      single         单文件种子 —— bitmagnet 不落清单，此处用 torrents.name/size 合成一条
+      no_info        尚未抓到文件信息
+      over_threshold 文件过多，bitmagnet 只保留前 100 个
+    """
+    ih = (infohash or "").strip().lower()
+    if len(ih) != 40 or any(c not in "0123456789abcdef" for c in ih):
+        return {"ok": False, "error": "无效的 infohash"}
+    sql = (
+        "SELECT json_build_object("
+        "'name', t.name, 'size', t.size, 'files_count', t.files_count,"
+        "'files_status', t.files_status::text,"
+        "'n', (SELECT count(*) FROM torrent_files f WHERE f.info_hash = t.info_hash),"
+        "'sum_size', (SELECT coalesce(sum(f.size), 0) FROM torrent_files f WHERE f.info_hash = t.info_hash),"
+        "'files', coalesce((SELECT json_agg(row_to_json(x)) FROM ("
+        " SELECT f.path, f.extension, f.size FROM torrent_files f"
+        " WHERE f.info_hash = t.info_hash ORDER BY f.\"index\") x), '[]'::json)"
+        ") FROM torrents t WHERE t.info_hash = decode('%s','hex');" % ih
+    )
+    # 与 bm_indexed 同一条安全底线：限时 + 抬 work_mem（会话级，不动全局）。
+    txt = docker_exec(["psql", "-U", "postgres", "-d", "bitmagnet", "-tAqc",
+                       "SET statement_timeout='25s'; SET work_mem='32MB'; " + sql], timeout=40)
+    if txt is None:
+        return {"ok": False, "error": "Postgres 查询失败"}
+    txt = txt.strip()
+    if not txt:
+        return {"ok": False, "error": "未找到该种子"}
+    if txt.startswith("ERROR"):
+        return {"ok": False, "error": txt[:160]}
+    try:
+        d = json.loads(txt)
+    except Exception as e:
+        return {"ok": False, "error": "解析失败: %s" % str(e)[:60], "raw": txt[:200]}
+    if not d or not d.get("name"):
+        return {"ok": False, "error": "未找到该种子"}
+    status = d.get("files_status") or ""
+    raw = d.get("files") or []
+    files = [{"path": f.get("path") or "", "ext": f.get("extension") or "",
+              "size": f.get("size") or 0} for f in raw]
+    total = d.get("size") or 0
+    if not files and status == "single":
+        # 单文件种子：bitmagnet 不保存清单，用种子自身名称/大小合成一条，避免面板显示成"无文件"。
+        files = [{"path": d.get("name") or "", "ext": "", "size": total}]
+    declared = d.get("files_count") or 0
+    return {
+        "ok": True,
+        "infohash": ih,
+        "name": d.get("name") or "",
+        "size": total,
+        "files_status": status,
+        "files_count": declared or None,
+        "files": files,
+        "n": len(files),
+        "files_sum_size": d.get("sum_size") or 0,
+        # over_threshold = bitmagnet 只存了前 100 个；declared 更大时同样提示截断。
+        "truncated": bool(status == "over_threshold" or declared > len(files)),
+        "magnet": "magnet:?xt=urn:btih:%s" % ih,
+    }
 
 
 def bm_search(q):
@@ -1275,6 +1340,22 @@ PAGE = r"""<!DOCTYPE html>
   .dist{font-size:12px;color:var(--muted);margin:3px 0}
   .dist b{color:var(--txt)}
   .sel{width:16px;height:16px}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:60;
+         align-items:center;justify-content:center;padding:18px}
+  .modal.show{display:flex}
+  .modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+              width:min(780px,100%);max-height:84vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal .hd{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:flex-start}
+  .modal .hd .tt{font-weight:600;word-break:break-all;flex:1}
+  .modal .bd{padding:10px 16px 16px;overflow:auto}
+  .modal .ft{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .ftable{width:100%;border-collapse:collapse;font-size:13px}
+  .ftable th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;padding:6px 8px;
+             border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);
+             white-space:nowrap}
+  .ftable td{padding:6px 8px;border-bottom:1px solid var(--line);word-break:break-all;vertical-align:top}
+  .ftable td.sz{text-align:right;white-space:nowrap;color:var(--muted);font-variant-numeric:tabular-nums}
+  .ftable td.ex{white-space:nowrap;color:var(--muted)}
   [data-theme="light"]{ --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef1f6; --line:#d7dce5;
      --txt:#1b2230; --muted:#5c6473; --acc:#3a6df0; --green:#1f9d57; --red:#d8453a;
      --amber:#b9770f; --chip:#e7ebf2; }
@@ -1435,6 +1516,17 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="modal" id="fileModal">
+  <div class="box">
+    <div class="hd">
+      <div class="tt" id="fmTitle">文件列表</div>
+      <button class="ghost" onclick="closeFiles()">✕ 关闭</button>
+    </div>
+    <div class="bd" id="fmBody"><div class="muted">加载中…</div></div>
+    <div class="ft" id="fmFoot"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1486,6 +1578,11 @@ function cardHtml(it, opts){
   if(opts.watch && it.magnet){
     acts+='<button data-watch="'+escAttr(it.magnet)+'" data-title="'+escAttr(it.title||it.name||"")+'">收藏</button>';
   }
+  if(opts.files && ih){
+    const fc=Number(it.files_count)||0;
+    acts+='<button class="ghost" data-files="'+escAttr(ih)+'" data-name="'+escAttr(it.title||it.name||"")+'">'+
+          (fc>0?('📄 '+fc):'📄 文件')+'</button>';
+  }
   if(opts.checkbox && ih){
     acts='<input type="checkbox" class="sel" data-ih="'+escAttr(ih)+'"> '+acts;
   }
@@ -1515,6 +1612,61 @@ function bindCardActions(box){
   box.querySelectorAll("button[data-watch]").forEach(b=>{
     b.onclick=()=>{ addWatch(b.getAttribute("data-watch"), b.getAttribute("data-title")); };
   });
+  box.querySelectorAll("button[data-files]").forEach(b=>{
+    b.onclick=()=>{ openFiles(b.getAttribute("data-files"), b.getAttribute("data-name")); };
+  });
+}
+
+// ---- 种子文件列表弹窗 ----
+function closeFiles(){ $("#fileModal").classList.remove("show"); }
+$("#fileModal").addEventListener("click", e=>{ if(e.target.id==="fileModal") closeFiles(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeFiles(); });
+
+const FSTATUS={
+  multi:"",
+  single:"单文件种子（BitMagnet 不为单文件种子保存清单，下方为合成条目）",
+  no_info:"BitMagnet 尚未抓到该种子的文件信息",
+  over_threshold:"文件数超过 BitMagnet 保存上限，仅保留前 100 个"
+};
+async function openFiles(ih, name){
+  const m=$("#fileModal");
+  $("#fmTitle").textContent = name || ("文件列表 · "+ih.slice(0,12)+"…");
+  $("#fmBody").innerHTML='<div class="muted"><span class="spinner"></span> 正在读取文件列表…</div>';
+  $("#fmFoot").innerHTML="";
+  m.classList.add("show");
+  let d;
+  try{ d=await jget("/api/files?infohash="+encodeURIComponent(ih)); }
+  catch(e){ d={ok:false,error:"请求失败"}; }
+  if(!d.ok){ $("#fmBody").innerHTML='<div class="muted">❌ '+escHtml(d.error||"读取失败")+'</div>'; return; }
+  const fl=d.files||[];
+  const sum=fl.reduce((a,b)=>a+(Number(b.size)||0),0);
+  const mag=d.magnet||("magnet:?xt=urn:btih:"+ih);
+  let head='<div class="muted" style="margin-bottom:8px">共 <b>'+fl.length+'</b> 个条目 · 合计 '+fmtSize(sum);
+  if(d.truncated && d.files_count) head+=' · 实际 '+d.files_count+' 个（已截断）';
+  head+='</div>';
+  const note=FSTATUS[d.files_status];
+  if(note) head+='<div class="muted" style="margin-bottom:8px">ℹ️ '+escHtml(note)+'</div>';
+  if(!fl.length){
+    $("#fmBody").innerHTML=head+'<div class="muted">没有可显示的文件条目。</div>';
+  }else{
+    let rows="";
+    fl.forEach(f=>{
+      const p=f.path||"(无路径)";
+      const slash=p.lastIndexOf("/");
+      const dir=slash>=0?p.slice(0,slash+1):"";
+      const base=slash>=0?p.slice(slash+1):p;
+      rows+='<tr><td>'+(dir?'<span class="muted">'+escHtml(dir)+'</span>':'')+escHtml(base)+'</td>'+
+            '<td class="ex">'+escHtml(f.ext||"")+'</td>'+
+            '<td class="sz">'+fmtSize(f.size||0)+'</td></tr>';
+    });
+    $("#fmBody").innerHTML=head+
+      '<table class="ftable"><thead><tr><th>路径</th><th>类型</th>'+
+      '<th style="text-align:right">大小</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }
+  $("#fmFoot").innerHTML='<button data-copy="'+escAttr(mag)+'">复制磁力</button>'+
+    '<button class="primary" data-dl="'+escAttr(mag)+'">直接下载</button>'+
+    '<span style="flex:1"></span><span class="muted" style="font-size:12px">'+escHtml(ih)+'</span>';
+  bindCardActions($("#fmFoot"));
 }
 
 // ---- 已索引种子 ----
@@ -1554,7 +1706,7 @@ function renderIndexed(){
   const box=$("#idxResults");
   if(!idxItems.length){box.innerHTML='<div class="muted">'+(term?("未找到匹配 “"+escHtml(term)+"” 的种子。"):"暂无已索引种子（BitMagnet 仍在抓 DHT，稍后再来）。")+'</div>';updateSelN();return;}
   box.innerHTML="";
-  filtered.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml(it,{checkbox:true})));
+  filtered.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml(it,{checkbox:true, files:true})));
   bindCardActions(box); updateSelN();
 }
 function updateSelN(){
@@ -1598,7 +1750,7 @@ async function loadSearch(){
   const arr=d.items||[];
   if(!arr.length){box.innerHTML='<div class="muted">未搜到结果（DHT 可能暂无该资源）。</div>';return;}
   box.innerHTML="";
-  arr.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml(it,{watch:true})));
+  arr.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml(it,{watch:true, files:true})));
   bindCardActions(box);
   toast("实时 DHT 命中 "+arr.length+" 条");
 }
@@ -1742,7 +1894,7 @@ function renderWatch(){
   const box=$("#watchResults");
   if(!w.length){box.innerHTML='<div class="muted">收藏夹为空。在已索引/搜索结果点「收藏」即可加入。</div>';return;}
   box.innerHTML="";
-  w.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml({title:it.title,magnet:it.magnet,infohash:_ih(it.magnet)},{checkbox:false})));
+  w.forEach(it=>box.insertAdjacentHTML("beforeend", cardHtml({title:it.title,magnet:it.magnet,infohash:_ih(it.magnet)},{checkbox:false, files:true})));
   // 收藏卡无下载按钮时仍给下载
   bindWatchActions(box);
 }
@@ -1933,6 +2085,10 @@ class H(BaseHTTPRequestHandler):
                 int(max_size) if max_size.isdigit() else None,
                 int(min_seeders) if min_seeders.isdigit() else None,
                 hide_adult))
+            return
+        if self.path.startswith("/api/files"):
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._json(bm_files(params.get("infohash", [""])[0]))
             return
         if self.path.startswith("/api/trackers/refresh"):
             self._json(refresh_trackers())
