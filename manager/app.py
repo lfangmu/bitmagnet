@@ -25,6 +25,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import ssl
+import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SSL_CTX = ssl._create_unverified_context()  # qBittorrent 现已启用自签 HTTPS
@@ -1286,9 +1287,11 @@ def _ov_worker():
          "WHERE updated_at > now()-interval '24 hours' GROUP BY 1 ORDER BY 1",
          20, lambda t: _ov_trend(t), 300),
     ]
+    _hist_init()
     while True:
         try:
             now = time.time()
+            _hist_maybe_snapshot(now)
             for key, sql, to, fn, ttl in specs:
                 with _OV_LOCK:
                     d = _OVERVIEW["data"] or {}
@@ -1371,6 +1374,83 @@ def bm_overview():
     if d is None:
         return {"ok": True, "computing": True}
     return dict(d)
+
+
+# ---- 历史趋势：快照落到容器本地 sqlite（/app/data），完全不碰 bitmagnet 库 ----
+# 注意：/app 是容器 FS，restart 保留、但容器被 recreate 会清空（历史会重新累积）。
+_HIST_DIR = "/app/data"
+_HIST_DB = _HIST_DIR + "/ov_history.sqlite"
+_HIST_INTERVAL = 600       # 每 10 分钟落一个快照
+_HIST_KEEP_DAYS = 60
+_HIST_LAST = 0
+_HIST_LOCK = threading.Lock()
+
+
+def _hist_init():
+    try:
+        os.makedirs(_HIST_DIR, exist_ok=True)
+        con = sqlite3.connect(_HIST_DB, timeout=10)
+        con.execute("CREATE TABLE IF NOT EXISTS ov_snap ("
+                    "ts INTEGER PRIMARY KEY, total INTEGER, new_24h INTEGER,"
+                    "ingest_rate REAL, classified_ratio REAL,"
+                    "classify_ceiling REAL, no_source_ratio REAL)")
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _hist_maybe_snapshot(now):
+    """后台 worker 每 _HIST_INTERVAL 秒落一个快照。"""
+    global _HIST_LAST
+    if now - _HIST_LAST < _HIST_INTERVAL:
+        return
+    with _OV_LOCK:
+        d = _OVERVIEW["data"] or {}
+    if not d.get("total"):
+        return
+    row = (int(now), d.get("total"), d.get("new_24h"), d.get("ingest_rate"),
+           d.get("classified_ratio"), d.get("classify_ceiling"),
+           d.get("no_source_ratio"))
+    try:
+        with _HIST_LOCK:
+            con = sqlite3.connect(_HIST_DB, timeout=10)
+            con.execute("INSERT OR REPLACE INTO ov_snap VALUES (?,?,?,?,?,?,?)", row)
+            con.execute("DELETE FROM ov_snap WHERE ts < ?",
+                        (int(now) - _HIST_KEEP_DAYS * 86400,))
+            con.commit()
+            con.close()
+    except Exception:
+        return
+    _HIST_LAST = now
+
+
+def bm_overview_history(days=7):
+    """历史趋势点：供 7d/30d 曲线使用。"""
+    try:
+        days = int(days)
+    except Exception:
+        days = 7
+    if days not in (7, 30):
+        days = 7
+    cutoff = int(time.time()) - days * 86400
+    pts = []
+    try:
+        with _HIST_LOCK:
+            con = sqlite3.connect(_HIST_DB, timeout=10)
+            cur = con.execute(
+                "SELECT ts,total,new_24h,ingest_rate,classified_ratio,"
+                "classify_ceiling,no_source_ratio FROM ov_snap "
+                "WHERE ts>=? ORDER BY ts", (cutoff,))
+            for r in cur.fetchall():
+                pts.append({"ts": r[0], "total": r[1], "new_24h": r[2],
+                            "ingest_rate": r[3], "classified_ratio": r[4],
+                            "classify_ceiling": r[5], "no_source_ratio": r[6]})
+            con.close()
+    except Exception:
+        return {"ok": True, "available": False, "points": [], "days": days}
+    return {"ok": True, "available": True, "points": pts, "days": days}
 
 
 
@@ -1751,6 +1831,7 @@ PAGE = r"""<!DOCTYPE html>
         <button class="ghost" onclick="loadOverview()">刷新</button></div>
     </div>
     <div id="ovBody"><div class="muted">采集中…</div></div>
+    <div id="ovTrend"></div>
   </div>
 
   <!-- 系统状态 -->
@@ -2296,7 +2377,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   else if(p==="queue"){loadQueue();}
   else if(p==="watch"){renderWatch();}
   else if(p==="search"){renderHistory();}
-  else if(p==="overview"){loadOverview();}
+  else if(p==="overview"){loadOverview();loadOverviewTrend();}
 });
 
 // 队列 Tab：每 5s 自动刷新（用户有选中时不打断）；状态 Tab：每 15s 拉一次
@@ -2363,11 +2444,45 @@ function loadOverview(){
   }).catch(e=>{ body.innerHTML='<div class="muted">加载失败：'+escHtml(String(e))+'</div>'; });
 }
 
+function trendSvg(pts,key,label,unit,color){
+  const vals=pts.map(x=>x[key]).filter(v=>v!=null);
+  if(vals.length<2) return '<h4>'+label+'</h4><div class="muted">历史点不足（每 10 分钟采集一次）</div>';
+  const mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals);
+  const w=600,hh=70,n=vals.length,step=n>1?w/(n-1):w;
+  let d="";
+  vals.forEach((v,i)=>{ const x=i*step, y=hh-((v-mn)/((mx-mn)||1))*hh; d+=(i?"L":"M")+x.toFixed(1)+" "+y.toFixed(1)+" "; });
+  return '<h4>'+label+'</h4>'+
+    '<svg viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" class="ov-spark">'+
+    '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2"/></svg>'+
+    '<div class="muted">'+mn.toLocaleString()+unit+' ~ '+mx.toLocaleString()+unit+
+    ' ｜ 最新 '+vals[vals.length-1].toLocaleString()+unit+' ｜ '+n+' 点</div>';
+}
+
+function loadOverviewTrend(days){
+  const el=$("#ovTrend"); if(!el) return;
+  days = days || window.__ovDays || 7;
+  window.__ovDays = days;
+  jget("/api/overview/history?days="+days).then(r=>{
+    const pts=r.points||[];
+    let h='<div class="ov-head" style="margin-top:16px"><h3>📉 历史趋势（'+days+'天）</h3>'+
+      '<div class="ov-meta"><button class="ghost" onclick="loadOverviewTrend(7)">7天</button>'+
+      '<button class="ghost" onclick="loadOverviewTrend(30)">30天</button></div></div>';
+    if(!r.available || pts.length<2){
+      el.innerHTML=h+'<div class="muted">历史数据积累中：每 10 分钟落一个快照，当前 '+pts.length+' 点（至少 2 点才出图）。</div>';
+      return;
+    }
+    el.innerHTML=h+trendSvg(pts,"ingest_rate","摄取速率趋势","/h","var(--acc)")+
+      trendSvg(pts,"classified_ratio","分类覆盖率趋势","%","#3aa76d")+
+      trendSvg(pts,"no_source_ratio","无源占比趋势","%","#c0703a");
+  }).catch(e=>{ el.innerHTML='<div class="muted">趋势加载失败：'+escHtml(String(e))+'</div>'; });
+}
+
 // 初始化：拉去重集合 + 默认加载已索引
 refreshDownloaded();
 loadIndexed(false);
 renderHistory();
 setInterval(()=>{ if(activePanel==="overview") loadOverview(); }, 10000);
+setInterval(()=>{ if(activePanel==="overview") loadOverviewTrend(); }, 300000);
 </script>
 </body>
 </html>"""
@@ -2446,6 +2561,9 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/stats"):
             self._json(bm_stats())
+            return
+        if self.path.startswith("/api/overview/history"):
+            self._json(bm_overview_history(30 if "days=30" in self.path else 7))
             return
         if self.path.startswith("/api/overview"):
             self._json(bm_overview())
