@@ -1131,6 +1131,178 @@ def bm_stats():
         pass
     return {"ok": True, "total": total, "by_type": by_type, "recent24h": recent24h}
 
+def _pg_overview_val(sql, timeout=15):
+    """跑一条只读聚合 SQL（work_mem=32MB + statement_timeout 兜底），返回解析文本或 None。"""
+    txt = docker_exec(["psql", "-U", "postgres", "-d", "bitmagnet", "-tAq", "-c",
+                       "SET work_mem='32MB'; SET statement_timeout='%ds'; %s" % (timeout, sql)],
+                      timeout=timeout + 20)
+    return txt
+
+
+def _ov_int(txt):
+    if txt is None:
+        return None
+    m = re.search(r"\d+", txt)
+    return int(m.group()) if m else None
+
+
+_OVERVIEW = {"ts": 0.0, "data": None, "started": False}
+_OV_TS = {}      # key -> 上次成功 ts
+_OV_FAIL = {}    # key -> 上次失败 ts（退避用）
+_OV_LOCK = threading.Lock()
+
+
+def _ov_setmany(updates, now):
+    """原子更新缓存（含 computed_at / ts）。"""
+    with _OV_LOCK:
+        d = _OVERVIEW["data"]
+        if d is None:
+            d = _OVERVIEW["data"] = {"ok": True}
+        d.update(updates)
+        d["computed_at"] = int(now)
+        _OVERVIEW["ts"] = now
+
+
+def _ov_parse_dist(txt):
+    dist, unc, tot = [], 0, 0
+    if not txt:
+        return None
+    for line in txt.strip().splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        a, b = line.rsplit("|", 1)
+        ct, cnt = a.strip(), int(b.strip())
+        dist.append({"type": ct, "count": cnt})
+        tot += cnt
+        if ct == "unknown":
+            unc = cnt
+    return (dist, unc, tot) if dist else None
+
+
+def _ov_fs(txt):
+    fs = []
+    if not txt:
+        return None
+    for line in txt.strip().splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        a, b = line.rsplit("|", 1)
+        fs.append({"status": a.strip(), "count": int(b.strip())})
+    return fs or None
+
+
+def _ov_trend(txt):
+    tr = []
+    if not txt:
+        return None
+    for line in txt.strip().splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        a, b = line.rsplit("|", 1)
+        tr.append({"hour": a.strip(), "count": int(b.strip())})
+    return tr or None
+
+
+def _ov_worker():
+    """常驻后台：逐个采集指标；爬虫写入致聚合饥饿时，空闲窗口自动补齐。
+    失败指标 10 分钟内退避，避免持续空耗 I/O。"""
+    specs = [
+        ("total", "SELECT count(*) FROM torrents", 20, lambda t: _ov_int(t), 60),
+        ("content_type",
+         "SELECT COALESCE(content_type,'unknown') AS ct, count(*) FROM torrent_contents GROUP BY ct ORDER BY 2 DESC",
+         30, lambda t: _ov_parse_dist(t), 300),
+        ("files_status",
+         "SELECT files_status, count(*) FROM torrents GROUP BY files_status ORDER BY 2 DESC",
+         20, lambda t: _ov_fs(t), 300),
+        ("no_source",
+         "SELECT count(*) FROM torrent_contents WHERE coalesce(seeders,0)=0",
+         20, lambda t: _ov_int(t), 300),
+        ("new_24h",
+         "SELECT count(*) FROM torrents WHERE updated_at > now()-interval '24 hours'",
+         20, lambda t: _ov_int(t), 300),
+        ("new_7d",
+         "SELECT count(*) FROM torrents WHERE updated_at > now()-interval '7 days'",
+         20, lambda t: _ov_int(t), 300),
+        ("hourly",
+         "SELECT date_trunc('hour', updated_at)::text, count(*) FROM torrents "
+         "WHERE updated_at > now()-interval '24 hours' GROUP BY 1 ORDER BY 1",
+         20, lambda t: _ov_trend(t), 300),
+    ]
+    while True:
+        try:
+            now = time.time()
+            for key, sql, to, fn, ttl in specs:
+                with _OV_LOCK:
+                    d = _OVERVIEW["data"] or {}
+                    last_ok = _OV_TS.get(key, 0)
+                    last_fail = _OV_FAIL.get(key, 0)
+                    fresh = (key in d) and (now - last_ok) < ttl
+                    backed_off = (now - last_fail) < 600
+                if fresh or backed_off:
+                    continue
+                try:
+                    raw = _pg_overview_val(sql, timeout=to)
+                except Exception:
+                    raw = None
+                val = fn(raw)
+                if val is None:
+                    with _OV_LOCK:
+                        _OV_FAIL[key] = time.time()
+                    time.sleep(1)
+                    continue
+                upd = {}
+                if key == "total":
+                    pt = _OVERVIEW.get("_prev_total")
+                    pts = _OVERVIEW.get("_prev_ts", 0)
+                    if pt is not None and pts:
+                        hrs = (now - pts) / 3600.0
+                        if hrs > 0.002:
+                            upd["ingest_rate"] = round((val - pt) / hrs, 1)
+                    _OVERVIEW["_prev_total"] = val
+                    _OVERVIEW["_prev_ts"] = now
+                    upd["total"] = val
+                elif key == "content_type":
+                    dist, unc, tot = val
+                    upd["content_type"] = dist
+                    upd["total_contents"] = tot
+                    upd["unclassified"] = unc
+                    upd["classified_ratio"] = round((1 - unc / tot) * 100, 1) if tot else None
+                elif key == "files_status":
+                    upd["files_status"] = val
+                elif key == "no_source":
+                    upd["no_source"] = val
+                    tc = (_OVERVIEW["data"] or {}).get("total_contents")
+                    if tc:
+                        upd["no_source_ratio"] = round(val / tc * 100, 1)
+                else:
+                    upd[key] = val
+                _ov_setmany(upd, now)
+                with _OV_LOCK:
+                    _OV_TS[key] = now
+                    _OV_FAIL.pop(key, None)
+                time.sleep(1)
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+def bm_overview():
+    """库概览快照：常驻后台工作线程采集 + 单查询超时 + 保留上次好值；
+    HTTP 请求永不阻塞，缺失指标在空闲窗口自动补齐。"""
+    if not _OVERVIEW["started"]:
+        _OVERVIEW["started"] = True
+        threading.Thread(target=_ov_worker, daemon=True).start()
+    with _OV_LOCK:
+        d = _OVERVIEW["data"]
+    if d is None:
+        return {"ok": True, "computing": True}
+    return dict(d)
+
+
+
 
 _MAINTAIN = {"running": False, "action": None, "started": 0, "log": "", "done": False, "ok": None}
 _MAINTAIN_LOCK = threading.Lock()
@@ -1369,6 +1541,22 @@ PAGE = r"""<!DOCTYPE html>
     .toolbar button,.toolbar select{width:100%}
     .card{padding:12px}
   }
+  .ov-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+  .ov-meta{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:8px}
+  .ov-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:14px}
+  .ov-cards .box{padding:12px;border-radius:10px;background:var(--panel2);border:1px solid var(--line)}
+  .ov-cards .n{font-size:20px;font-weight:600}
+  .ov-cards .l{font-size:12px;color:var(--muted);margin-top:2px}
+  .ov-bars{margin:6px 0 14px}
+  .ov-bar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
+  .ov-bar-l{width:92px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+  .ov-bar-t{flex:1;background:var(--panel2);border-radius:6px;height:14px;overflow:hidden}
+  .ov-bar-f{display:block;height:100%;background:linear-gradient(90deg,var(--acc),#7aa2ff);border-radius:6px}
+  .ov-bar-v{width:74px;text-align:right;color:var(--txt)}
+  .ov-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .chip{background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px}
+  .ov-spark{width:100%;height:90px;display:block;margin-top:4px}
+  h4{margin:14px 0 6px;font-size:14px;color:var(--txt);font-weight:600}
 </style>
 </head>
 <body>
@@ -1386,6 +1574,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="tab" data-p="search">🔎 实时 DHT</div>
     <div class="tab" data-p="queue">📥 下载队列</div>
     <div class="tab" data-p="watch">❤️ 收藏</div>
+    <div class="tab" data-p="overview">📈 库概览</div>
     <div class="tab" data-p="status">📊 系统状态</div>
   </div>
 
@@ -1481,6 +1670,16 @@ PAGE = r"""<!DOCTYPE html>
       <span class="muted" id="watchCount"></span>
     </div>
     <div id="watchResults"></div>
+  </div>
+
+  <!-- 库概览 -->
+  <div class="panel" id="p-overview">
+    <div class="ov-head">
+      <h3>📈 库概览</h3>
+      <div class="ov-meta"><span id="ovUpdated" class="muted">—</span>
+        <button class="ghost" onclick="loadOverview()">刷新</button></div>
+    </div>
+    <div id="ovBody"><div class="muted">采集中…</div></div>
   </div>
 
   <!-- 系统状态 -->
@@ -2026,6 +2225,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   else if(p==="queue"){loadQueue();}
   else if(p==="watch"){renderWatch();}
   else if(p==="search"){renderHistory();}
+  else if(p==="overview"){loadOverview();}
 });
 
 // 队列 Tab：每 5s 自动刷新（用户有选中时不打断）；状态 Tab：每 15s 拉一次
@@ -2034,10 +2234,68 @@ setInterval(()=>{ if(activePanel==="status"){ loadSystem(); loadEgress(); loadTu
 
 function tick(){$("#clock").textContent=new Date().toLocaleString("zh-CN");}
 setInterval(tick,1000);tick();
+function loadOverview(){
+  const body=$("#ovBody");
+  jget("/api/overview").then(d=>{
+    if(d.computing){
+      body.innerHTML='<div class="muted">首次采集较慢（聚合查询在爬虫写入下会被限流），请稍候自动刷新…</div>';
+      setTimeout(()=>{ if(activePanel==="overview") loadOverview(); }, 4000);
+      return;
+    }
+    const ca=d.computed_at?new Date(d.computed_at*1000).toLocaleString("zh-CN"):"";
+    $("#ovUpdated").textContent = ca?("更新于 "+ca):"";
+    let h="";
+    const cards=[];
+    if(d.total!=null) cards.push(["已索引种子", d.total.toLocaleString()]);
+    if(d.new_24h!=null) cards.push(["24h 新增", d.new_24h.toLocaleString()]);
+    if(d.new_7d!=null) cards.push(["7d 新增", d.new_7d.toLocaleString()]);
+    if(d.ingest_rate!=null) cards.push(["摄取速率", d.ingest_rate.toLocaleString()+"/h"]);
+    if(d.classified_ratio!=null) cards.push(["已分类占比", d.classified_ratio+"%"]);
+    if(d.no_source_ratio!=null) cards.push(["无源占比", d.no_source_ratio+"%"]);
+    if(cards.length){
+      h+='<div class="ov-cards">';
+      for(const c of cards) h+='<div class="box"><div class="n">'+c[1]+'</div><div class="l">'+c[0]+'</div></div>';
+      h+='</div>';
+    }
+    if(d.content_type && d.content_type.length){
+      const max=Math.max.apply(null, d.content_type.map(x=>x.count));
+      h+='<h4>内容类型分布</h4><div class="ov-bars">';
+      for(const x of d.content_type.slice(0,12)){
+        const pct=max?Math.round(x.count/max*100):0;
+        const label=x.type==="unknown"?"未分类":x.type;
+        h+='<div class="ov-bar"><span class="ov-bar-l">'+escHtml(label)+'</span>'+
+           '<span class="ov-bar-t"><span class="ov-bar-f" style="width:'+pct+'%"></span></span>'+
+           '<span class="ov-bar-v">'+x.count.toLocaleString()+'</span></div>';
+      }
+      h+='</div>';
+    }
+    if(d.files_status && d.files_status.length){
+      const map={"multi":"多文件","single":"单文件","no_info":"无信息","over_threshold":"超阈值(>100)"};
+      h+='<h4>文件清单状态</h4><div class="ov-chips">';
+      for(const x of d.files_status)
+        h+='<span class="chip">'+escHtml(map[x.status]||x.status)+'：'+x.count.toLocaleString()+'</span>';
+      h+='</div>';
+    }
+    if(d.hourly && d.hourly.length){
+      const vals=d.hourly.map(x=>x.count);
+      const mx=Math.max.apply(null, vals.concat([1]));
+      const w=600, hh=80, n=vals.length, step=n>1?w/(n-1):w;
+      let pts="";
+      vals.forEach((v,i)=>{ const x=i*step, y=hh-(v/mx)*hh; pts+=(i?"L":"M")+x.toFixed(1)+" "+y.toFixed(1)+" "; });
+      h+='<h4>近 24h 新增趋势（按小时）</h4>'+
+         '<svg viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" class="ov-spark">'+
+         '<path d="'+pts+'" fill="none" stroke="var(--acc)" stroke-width="2"/></svg>';
+    }
+    if(!h) h='<div class="muted">暂无可用数据（聚合查询超时，将自动重试）。</div>';
+    body.innerHTML=h;
+  }).catch(e=>{ body.innerHTML='<div class="muted">加载失败：'+escHtml(String(e))+'</div>'; });
+}
+
 // 初始化：拉去重集合 + 默认加载已索引
 refreshDownloaded();
 loadIndexed(false);
 renderHistory();
+setInterval(()=>{ if(activePanel==="overview") loadOverview(); }, 10000);
 </script>
 </body>
 </html>"""
@@ -2116,6 +2374,9 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/stats"):
             self._json(bm_stats())
+            return
+        if self.path.startswith("/api/overview"):
+            self._json(bm_overview())
             return
         if self.path.startswith("/api/maintain"):
             self._json(maintain_status())
